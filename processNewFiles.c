@@ -8,70 +8,194 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
-#include <ctype.h>
 #include <sys/stat.h>
-#include <sys/mman.h>
 
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <stdbool.h>
 
 #include <argtable3.h>
 #include <unistd.h>
-#include <dirent.h>
+#include <ftw.h>
+
+typedef struct {
+    const char * path;
+    int          fd;
+} tDirectory;
 
 struct {
     const char *       executableName;
     FILE *             outputFile;
     int                debugLevel;
-    struct
-    {
-        int root;
-        int seen;
-        int queue;
-    } dir;
+
+    tDirectory  root;
+    tDirectory  seen;
+    tDirectory  queue;
+
     struct
     {
         struct arg_lit  * help;
         struct arg_lit  * version;
+        struct arg_file * executable;
         struct arg_file * path;
-        struct arg_end  * end;
+        struct arg_end  * end;  // must be last !
     } option;
 } g;
 
-const char * catstrings( const char * front, const char * back )
+const char * catPath( const char * front, const char * back )
 {
     char * result;
-    int l = strlen( front ) + strlen(back ) + 1;
+    size_t l = strlen( front ) + 1 + strlen(back ) + 1;
     result = calloc( l, sizeof(char) );
     if ( result != NULL )
     {
         strncpy( result, front, l );
+        strncat( result, "/", l );
         strncat( result, back, l );
     }
     return (const char *)result;
 }
 
-int makeSubDir( const char * subdir )
+int makeSubDir( const char * subDirPath, tDirectory * dir )
 {
     int result = 0;
 
-    if ( mkdirat( g.dir.root, subdir, S_IRWXU | S_IRWXG) < 0 && errno != EEXIST )
+    dir->path    = catPath( g.root.path, subDirPath );
+    if ( mkdirat( g.root.fd, subDirPath, S_IRWXU | S_IRWXG) < 0 && errno != EEXIST )
     {
-        fprintf( stderr, "Error: cound't create subdirectory \'%s\' (%d: %s)\n",
-                 subdir, errno, strerror(errno));
+        fprintf( stderr, "Error: couldn't create subdirectory \'%s\' (%d: %s)\n",
+                 subDirPath, errno, strerror(errno));
         result = -errno;
     } else {
-        result = openat( g.dir.root, subdir, O_DIRECTORY );
-        if ( result < 0 )
+        dir->fd = openat( g.root.fd, subDirPath, O_DIRECTORY );
+        if ( dir->fd < 0 )
         {
-            fprintf( stderr, "Error: cound't open subdirectory \'%s\' (%d: %s)\n",
-                     subdir, errno, strerror(errno));
+            fprintf( stderr, "Error: couldn't open subdirectory \'%s\' (%d: %s)\n",
+                     subDirPath, errno, strerror(errno));
             result = -errno;
         }
     }
     return result;
 }
+
+int deleteOrphan( const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf )
+{
+    int result = FTW_CONTINUE;
+    const char * base = &fpath[ ftwbuf->base ];
+
+    switch ( typeflag )
+    {
+    case FTW_F: // fpath is a regular file.
+        if ( *base != '.' )
+        {
+            printf( "%d: file: %s (%lu)\n", ftwbuf->level, base, sb->st_nlink );
+            if ( sb->st_nlink == 1 )
+            {
+                printf( "delete orphan: %s\n", fpath );
+                unlink( fpath );
+            }
+        }
+        break;
+
+    case FTW_D: // fpath is a directory.
+        if ( *base == '.' && ftwbuf->level > 0)
+        {
+            result = FTW_SKIP_SUBTREE;
+        } else
+        {
+            printf( "%d: directory: %s\n", ftwbuf->level, base );
+        }
+        break;
+
+    default:fprintf( stderr, "Error: %d: typeflag %d\n", ftwbuf->level, typeflag );
+        break;
+    }
+    return result;
+}
+
+
+int linkOrphan( const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf )
+{
+    int result = FTW_CONTINUE;
+    const char * base = &fpath[ ftwbuf->base ];
+    const char * relpath = NULL;
+
+    const char * r = g.root.path;
+    const char * p = fpath;
+
+    do { ++r; ++p; } while ( *r != '\0' && *r == *p );
+    if (*r == '\0')
+    {
+        if (*p == '/') { ++p; }
+        relpath = p;
+        printf("relPath: \'%s\'\n", relpath );
+    }
+
+    switch ( typeflag )
+    {
+    case FTW_F: // fpath is a regular file.
+        if ( *base != '.')
+        {
+            printf("%d: file: %s (%lu)\n", ftwbuf->level, base, sb->st_nlink );
+            if ( sb->st_nlink == 1 )
+            {
+                printf("new file: %s\n", relpath );
+                linkat( g.root.fd, relpath, g.seen.fd,  relpath, 0 );
+                linkat( g.root.fd, relpath, g.queue.fd, relpath, 0 );
+            }
+        }
+        break;
+
+    case FTW_D: // fpath is a directory.
+        if ( *base == '.')
+        {
+            result = FTW_SKIP_SUBTREE;
+        } else {
+            printf("%d: directory: %s\n", ftwbuf->level, base );
+            mkdirat(g.seen.fd, relpath, S_IRWXU | S_IRWXG );
+            mkdirat(g.queue.fd, relpath, S_IRWXU | S_IRWXG );
+        }
+        break;
+
+    default:
+        fprintf( stderr, "Error: %d: typeflag %d\n", ftwbuf->level, typeflag );
+        break;
+    }
+    return result;
+}
+
+int processFile( const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf )
+{
+    int result = FTW_CONTINUE;
+    const char * base = &fpath[ ftwbuf->base ];
+
+    if (ftwbuf->level > 0)
+    {
+        switch ( typeflag )
+        {
+        case FTW_F: // fpath is a regular file.
+            if ( *base != '.')
+            {
+                printf("%d: execute with file: %s (%lu)\n", ftwbuf->level, fpath, sb->st_nlink );
+            }
+            break;
+
+        case FTW_D: // fpath is a directory.
+            if ( *base == '.' && ftwbuf->level > 0)
+            {
+                result = FTW_SKIP_SUBTREE;
+            } else {
+                printf("%d: directory: %s\n", ftwbuf->level, base );
+            }
+            break;
+
+        default:
+            fprintf( stderr, "Error: %d: typeflag %d\n", ftwbuf->level, typeflag );
+            break;
+        }
+    }
+    return result;
+}
+
 
 int processDirectory( const char * dir )
 {
@@ -79,25 +203,47 @@ int processDirectory( const char * dir )
 
     printf( " processing \'%s\'\n", dir );
 
-    g.dir.root  = open( dir, O_DIRECTORY );
-    if ( g.dir.root < 0 )
+    g.root.path    = strdup( dir );
+    g.root.fd      = open( dir, O_DIRECTORY );
+    if ( g.root.fd < 0 )
     {
-        fprintf( stderr, "Error: cound't open \'%s\' (%d: %s)\n",
+        fprintf( stderr, "Error: couldn't open \'%s\' (%d: %s)\n",
                  dir, errno, strerror(errno));
         result = -errno;
     } else {
-        g.dir.seen = makeSubDir( ".seen" );
-        if ( g.dir.seen < 0 )
+        result = makeSubDir( ".seen", &g.seen );
+        if ( result == 0 )
         {
-            result = g.dir.seen;
-        }
-        g.dir.queue = makeSubDir( ".queue" );
-        if ( g.dir.queue < 0 )
-        {
-            result = g.dir.queue;
+            result = makeSubDir( ".queue", &g.queue );
         }
     }
 
+    if ( result == 0 )
+    {
+        // scan for orphans, and delete them
+        result = nftw( g.seen.path, deleteOrphan, 12, FTW_ACTIONRETVAL | FTW_MOUNT );
+        if (result != 0)
+        {
+            fprintf( stderr, "Error: couldn't prune orphans in the \'%s\'  directory (%d: %s)",
+                     g.seen.path, errno, strerror(errno) );
+        } else {
+            // scan for files we have not seen yet, and hard-link them to 'seen' and 'queue'
+            result = nftw( g.root.path, linkOrphan, 12, FTW_ACTIONRETVAL | FTW_MOUNT );
+            if (result != 0)
+            {
+                fprintf( stderr, "Error: couldn't link new files in the \'%s\' directory (%d: %s)",
+                         g.root.path, errno, strerror(errno) );
+            } else {
+                // scan the queue for files we have not successfully processed yet
+                result = nftw( g.queue.path, processFile, 12, FTW_ACTIONRETVAL | FTW_MOUNT );
+                if (result != 0)
+                {
+                    fprintf( stderr, "Error: couldn't process queued files in the \'%s\' directory (%d: %s)",
+                             g.queue.path, errno, strerror(errno));
+                }
+            }
+        }
+    }
     return result;
 }
 
@@ -165,14 +311,16 @@ int main( int argc, char * argv[] )
     /* the global arg_xxx structs above are initialised within the argtable */
     void * argtable[] =
         {
-            g.option.help    = arg_litn( "h", "help", 0, 1,
+            g.option.help       = arg_litn( "h", "help", 0, 1,
                                         "display this help (and exit)" ),
-            g.option.version = arg_litn( "V", "version", 0, 1,
+            g.option.version    = arg_litn( "V", "version", 0, 1,
                                         "display version info (and exit)" ),
-            g.option.path    = arg_filen(NULL, NULL, "<file>", 1, 20,
+            g.option.executable = arg_filen("x", "exec", "<executable>", 1, 1,
+                                         "path to executable" ),
+            g.option.path       = arg_filen(NULL, NULL, "<file>", 1, 20,
                                         "input files" ),
 
-            g.option.end     = arg_end( 20 )
+            g.option.end        = arg_end( 20 )
         };
 
     int nerrors = arg_parse( argc, argv, argtable );
