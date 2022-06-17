@@ -17,6 +17,12 @@
 #include <unistd.h>
 #include <ftw.h>
 
+#include <inotify.h>
+
+#include <uthash.h>
+
+#undef  QUEUE_SUPPORT
+
 typedef struct {
     const char * path;
     int          fd;
@@ -27,15 +33,18 @@ struct {
     FILE *             outputFile;
     int                debugLevel;
 
+    int         watchfd;
     tDirectory  root;
     tDirectory  seen;
+#if QUEUE_SUPPORT
     tDirectory  queue;
+#endif
 
     struct
     {
         struct arg_lit  * help;
         struct arg_lit  * version;
-        struct arg_file * executable;
+        struct arg_lit  * zero;
         struct arg_file * path;
         struct arg_end  * end;  // must be last !
     } option;
@@ -77,6 +86,39 @@ int makeSubDir( const char * subDirPath, tDirectory * dir )
     return result;
 }
 
+/*
+ * create inotify watches
+ */
+int watchDirectory( const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf )
+{
+    int result = FTW_CONTINUE;
+    const char * base = &fpath[ ftwbuf->base ];
+
+    switch ( typeflag )
+    {
+    case FTW_F: // fpath is a regular file - ignore
+        break;
+
+    case FTW_D: // fpath is a directory.
+        if ( *base == '.' && ftwbuf->level > 0)
+        {
+            result = FTW_SKIP_SUBTREE;
+        }
+        else
+        {
+            fprintf( stderr,  "%d: directory: %s\n", ftwbuf->level, base );
+
+        }
+        break;
+
+    default:
+        fprintf( stderr, "Error: %d: typeflag %d\n", ftwbuf->level, typeflag );
+        break;
+    }
+    return result;
+}
+
+
 int deleteOrphan( const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf )
 {
     int result = FTW_CONTINUE;
@@ -87,10 +129,10 @@ int deleteOrphan( const char *fpath, const struct stat *sb, int typeflag, struct
     case FTW_F: // fpath is a regular file.
         if ( *base != '.' )
         {
-            printf( "%d: file: %s (%lu)\n", ftwbuf->level, base, sb->st_nlink );
+            fprintf( stderr,  "%d: file: %s (%lu)\n", ftwbuf->level, base, sb->st_nlink );
             if ( sb->st_nlink == 1 )
             {
-                printf( "delete orphan: %s\n", fpath );
+                fprintf( stderr,  "delete orphan: %s\n", fpath );
                 unlink( fpath );
             }
         }
@@ -102,7 +144,7 @@ int deleteOrphan( const char *fpath, const struct stat *sb, int typeflag, struct
             result = FTW_SKIP_SUBTREE;
         } else
         {
-            printf( "%d: directory: %s\n", ftwbuf->level, base );
+            fprintf( stderr,  "%d: directory: %s\n", ftwbuf->level, base );
         }
         break;
 
@@ -127,7 +169,7 @@ int linkOrphan( const char *fpath, const struct stat *sb, int typeflag, struct F
     {
         if (*p == '/') { ++p; }
         relpath = p;
-        printf("relPath: \'%s\'\n", relpath );
+        fprintf( stderr, "relPath: \'%s\'\n", relpath );
     }
 
     switch ( typeflag )
@@ -135,24 +177,28 @@ int linkOrphan( const char *fpath, const struct stat *sb, int typeflag, struct F
     case FTW_F: // fpath is a regular file.
         if ( *base != '.')
         {
-            printf("%d: file: %s (%lu)\n", ftwbuf->level, base, sb->st_nlink );
+            fprintf( stderr, "%d: file: %s (%lu)\n", ftwbuf->level, base, sb->st_nlink );
             if ( sb->st_nlink == 1 )
             {
-                printf("new file: %s\n", relpath );
+                printf("%s\n", fpath );
                 linkat( g.root.fd, relpath, g.seen.fd,  relpath, 0 );
+#if QUEUE_SUPPORT
                 linkat( g.root.fd, relpath, g.queue.fd, relpath, 0 );
+#endif
             }
         }
         break;
 
     case FTW_D: // fpath is a directory.
-        if ( *base == '.')
+        if ( *base == '.') // is it a hidden directory?
         {
             result = FTW_SKIP_SUBTREE;
         } else {
-            printf("%d: directory: %s\n", ftwbuf->level, base );
+            fprintf( stderr, "%d: directory: %s\n", ftwbuf->level, base );
             mkdirat(g.seen.fd, relpath, S_IRWXU | S_IRWXG );
+#if QUEUE_SUPPORT
             mkdirat(g.queue.fd, relpath, S_IRWXU | S_IRWXG );
+#endif
         }
         break;
 
@@ -175,7 +221,7 @@ int processFile( const char *fpath, const struct stat *sb, int typeflag, struct 
         case FTW_F: // fpath is a regular file.
             if ( *base != '.')
             {
-                printf("%d: execute with file: %s (%lu)\n", ftwbuf->level, fpath, sb->st_nlink );
+                fprintf( stderr, "%d: execute with file: %s (%lu)\n", ftwbuf->level, fpath, sb->st_nlink );
             }
             break;
 
@@ -184,7 +230,7 @@ int processFile( const char *fpath, const struct stat *sb, int typeflag, struct 
             {
                 result = FTW_SKIP_SUBTREE;
             } else {
-                printf("%d: directory: %s\n", ftwbuf->level, base );
+                fprintf( stderr, "%d: directory: %s\n", ftwbuf->level, base );
             }
             break;
 
@@ -201,7 +247,7 @@ int processDirectory( const char * dir )
 {
     int result = 0;
 
-    printf( " processing \'%s\'\n", dir );
+    fprintf( stderr,  " processing \'%s\'\n", dir );
 
     g.root.path    = strdup( dir );
     g.root.fd      = open( dir, O_DIRECTORY );
@@ -212,10 +258,12 @@ int processDirectory( const char * dir )
         result = -errno;
     } else {
         result = makeSubDir( ".seen", &g.seen );
+#if QUEUE_SUPPORT
         if ( result == 0 )
         {
             result = makeSubDir( ".queue", &g.queue );
         }
+#endif
     }
 
     if ( result == 0 )
@@ -227,13 +275,15 @@ int processDirectory( const char * dir )
             fprintf( stderr, "Error: couldn't prune orphans in the \'%s\'  directory (%d: %s)",
                      g.seen.path, errno, strerror(errno) );
         } else {
-            // scan for files we have not seen yet, and hard-link them to 'seen' and 'queue'
+            // scan for files we have not seen yet, and hard-link them into the '.seen' hierarchy
             result = nftw( g.root.path, linkOrphan, 12, FTW_ACTIONRETVAL | FTW_MOUNT );
             if (result != 0)
             {
                 fprintf( stderr, "Error: couldn't link new files in the \'%s\' directory (%d: %s)",
                          g.root.path, errno, strerror(errno) );
-            } else {
+            }
+#if QUEUE_SUPPORT
+            else {
                 // scan the queue for files we have not successfully processed yet
                 result = nftw( g.queue.path, processFile, 12, FTW_ACTIONRETVAL | FTW_MOUNT );
                 if (result != 0)
@@ -242,6 +292,7 @@ int processDirectory( const char * dir )
                              g.queue.path, errno, strerror(errno));
                 }
             }
+#endif
         }
     }
     return result;
@@ -260,13 +311,13 @@ int processPath(const char * path)
     absPath = realpath( path, NULL );
     if (absPath == NULL )
     {
-        fprintf( stderr, "Error: cound't convert \'%s\' into an absolute path (%d: %s)\n",
+        fprintf( stderr, "Error: couldn't convert \'%s\' into an absolute path (%d: %s)\n",
                  path, errno, strerror(errno));
         result = -errno;
     } else {
         if ( stat( absPath, &info ) < 0)
         {
-            fprintf( stderr, "Error: cound't get info about \'%s\' (%d: %s)\n",
+            fprintf( stderr, "Error: couldn't get info about \'%s\' (%d: %s)\n",
                      absPath, errno, strerror(errno));
             result = -errno;
         } else {
@@ -315,8 +366,8 @@ int main( int argc, char * argv[] )
                                         "display this help (and exit)" ),
             g.option.version    = arg_litn( "V", "version", 0, 1,
                                         "display version info (and exit)" ),
-            g.option.executable = arg_filen("x", "exec", "<executable>", 1, 1,
-                                         "path to executable" ),
+            g.option.zero       = arg_litn("0", "zero", 0, 1,
+                                         "terminate the paths being output with a null" ),
             g.option.path       = arg_filen(NULL, NULL, "<file>", 1, 20,
                                         "input files" ),
 
