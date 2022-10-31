@@ -12,7 +12,7 @@ add_executable( processNewFiles
                 processNewFiles.c processNewFiles.h
                 logStuff.c logStuff.h
                 events.c   events.h
-        )
+        rescan.c rescan.h)
 
 target_link_libraries( processNewFiles dl config argtable3 m )
 

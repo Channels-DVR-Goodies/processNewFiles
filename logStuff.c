@@ -167,7 +167,7 @@ void initLogStuff( const char * name )
     }
     openlog( gMyName, LOG_CONS | LOG_PID | LOG_NDELAY, LOG_LOCAL1);
 
-    // initialize globals to something safe until startLogStuff has been invoked
+    // initialize gEvent to something safe until startLogStuff has been invoked
 
     for ( int i = 0; i < kLogMaxPriotity; ++i )
     {

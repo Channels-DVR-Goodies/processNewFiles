@@ -14,7 +14,7 @@
 #include "logStuff.h"
 
 
-/** globals */
+/** gEvent */
 tGlobals g;
 
 
@@ -37,201 +37,9 @@ tError printUsage( void ** argtable )
 
 
 
+#if 0
 ssize_t appendString( char ** string, const char * fmt, ... )
-        __attribute__ ((format (printf, 2, 3)));
-
-/**
- * @brief
- * @param pid
- * @return
- */
-tError createPidFile( pid_t pid )
-{
-    tError result = 0;
-
-    if ( g.pidFilename != NULL ) {
-        FILE * pidFile = fopen( g.pidFilename, "w" );
-        if ( pidFile == NULL ) {
-            logError( "Error: unable to open %s for writing",
-                      g.pidFilename );
-            result = -errno;
-        } else {
-            if ( fprintf( pidFile, "%d", pid ) == -1 ) {
-                logError( "Error: unable to write pid to %s", g.pidFilename );
-                result = -errno;
-            }
-            fclose( pidFile );
-        }
-    }
-
-    return result;
-}
-
-/**
- * @brief
- * @return
- */
-pid_t getDaemonPID( void )
-{
-    pid_t result;
-
-    FILE * pidFile = fopen( g.pidFilename, "r" );
-    if ( pidFile == NULL ) {
-        logError( "Error: unable to open %s for reading",
-                  g.pidFilename );
-        result = -errno;
-    } else {
-        if ( fscanf( pidFile, "%d", &result ) == -1 || result == 0 ) {
-            logError( "Error: unable to read pid from %s",
-                      g.pidFilename );
-            result = -errno;
-        }
-        fclose( pidFile );
-    }
-
-    return result;
-}
-
-void removePIDfile()
-{
-    if ( g.pidFilename != NULL ) {
-        unlink( g.pidFilename );
-        free((char *)g.pidFilename );
-        g.pidFilename = NULL;
-    }
-}
-
-
-/**
- * @brief
- */
-tError startDaemon( void )
-{
-    tError result = 0;
-    pid_t  pid    = fork();
-    switch ( pid ) {
-    case -1: // failed
-        logError( "Unable to start daemon process" );
-        result = -errno;
-        break;
-
-    case 0: // child
-//        result = initPidFilename( g.executableName );
-        logDebug( "pidFilename: \'%s\'", g.pidFilename );
-//        return runDaemon();
-        break;
-
-    default: // parent
-        // everything happens in the child
-        break;
-    }
-    return result;
-}
-
-/**
- * @brief
- * Note: this will probably be called from another instance invoked with --kill
- * @return
- */
-tError stopDaemon( void )
-{
-    tError result = 0;
-    pid_t  pid    = getDaemonPID();
-    logError( "pid: \'%d\'", pid );
-    if ( pid < 0 ) {
-        result = pid;
-    } else if ( killpg( pid, SIGTERM ) == -1 ) {
-        logError( "Error: failed to signal the daemon" );
-        result = -errno;
-    }
-    return result;
-}
-
-/**
- * @brief
- * @param executableName
- * @return
- */
-tError initPidFilename( const char * executableName )
-{
-    tError result = 0;
-
-    errno         = 0;
-    if ( g.pidFilename == NULL ) {
-        size_t len = sizeof( "/var/run//.pid" ) + strlen( executableName ) * 2;
-        char * pidName = calloc( 1, len );
-        if ( pidName == NULL ) {
-            logError( "Error: unable to allocate memory  " );
-            result = -errno;
-        } else {
-            snprintf( pidName, len, "/var/run/%s", executableName );
-            if ( mkdir( pidName, S_IRWXU) == -1 && errno != EEXIST ) {
-                logError( "Error: unable to create directory %s", pidName );
-                result = -errno;
-            } else {
-                errno = 0;
-                snprintf( pidName, len,
-                          "/var/run/%s/%s.pid",
-                          executableName, executableName );
-                g.pidFilename = pidName;
-            }
-        }
-    }
-    return result;
-}
-
-/**
- * @brief
- */
-void daemonExit( void )
-{
-    logInfo( "daemonExit()" );
-    removePIDfile();
-}
-
-/**
- * @brief
- * @param signum
- */
-void daemonSignal( int signum )
-{
-    logInfo( "daemonSignal(%d)", signum );
-    removePIDfile();
-}
-
-/**
- * @brief
- * @return
- */
-int registerHandlers( void )
-{
-    pid_t pid = setsid();
-
-    int result = createPidFile( pid );
-    if ( result == 0 ) {
-        /* register a handler for SIGTERM to remove the pid file */
-        struct sigaction new_action;
-        struct sigaction old_action;
-
-        sigemptyset( &new_action.sa_mask );
-        new_action.sa_handler = daemonSignal;
-        new_action.sa_flags   = 0;
-
-        sigaction( SIGTERM, &new_action, &old_action );
-
-        /* and if we exit normally, also remove the pid file */
-        if ( atexit( daemonExit ) != 0 ) {
-            logError( "Error: daemon failed to register an exit handler" );
-            result = -errno;
-        }
-    }
-    if ( result == 0 ) {
-        result = eventLoop();
-        // eventLoop() is not expected to return in normal operation
-    }
-    return result;
-}
-
+__attribute__ ((format (printf, 2, 3)));
 /**
  * @brief
  * @param string  the string to append to
@@ -260,65 +68,86 @@ ssize_t appendString( char ** string, const char * fmt, ... )
 
     return len + addLength;
 }
+#endif
 
-int importTree( config_setting_t * group )
+tError importTree( const config_setting_t * group )
 {
+    tError result = 0;
     if ( config_setting_is_group( group ) ) {
-        const char * path;
-        const char * exec;
-        config_setting_t * member;
+        const char * path = NULL;
+        const char * exec = NULL;
+        const config_setting_t * member;
 
         member = config_setting_get_member( group, "path" );
-        if ( member != NULL ) {
+        if ( member == NULL ) {
+            logError( "in %s at line %d: watch group doesn't have a \'path\' element",
+                      config_setting_source_file( group ),
+                      config_setting_source_line( group ) );
+            result = -EINVAL;
+        } else {
             path = config_setting_get_string( member );
             if ( path != NULL ) {
                 logDebug( "path = \"%s\"", path );
-            }
-        }
-
-        member = config_setting_get_member( group, "exec" );
-        if ( member != NULL ) {
-            exec = config_setting_get_string( member );
-            if ( exec != NULL ) {
-                logDebug( "exec = \"%s\"", exec );
+                member = config_setting_get_member( group, "exec" );
+                if ( member != NULL ) {
+                    exec = config_setting_get_string( member );
+                    if ( exec != NULL ) {
+                        logDebug( "exec = \"%s\"", exec );
+                    }
+                }
+                result = createTree( path, exec );
             }
         }
     } else {
-        logError( "in %s at line %d: watch entry must be a group", config_setting_source_file( group ), config_setting_source_line( group ) );
+        logError( "in %s at line %d: watch entry must be a group",
+                  config_setting_source_file( group ),
+                  config_setting_source_line( group ) );
     }
-    return 0;
+    return result;
 }
 
-int importConfig( config_t * config )
+/**
+ * @brief
+ * @param config
+ * @return
+ */
+tError importConfig( const config_t * config )
 {
+    tError result = 0;
 #ifdef DEBUG
     fprintf( stdout, "###\n" );
     config_write( config, stdout );
 #endif
-    config_setting_t * setting = config_lookup( config, "watch" );
+
+    const config_setting_t * setting = config_lookup( config, "watch" );
     if ( setting == NULL ) {
         logError( "unable to find 'watch' element" );
+        result = -EINVAL;
     } else {
-        switch ( setting->type ) {
+        int count;
+        switch ( setting->type )
+        {
         case CONFIG_TYPE_GROUP:
-            importTree( setting );
+            result = importTree( setting );
             break;
 
         case CONFIG_TYPE_LIST:
-            {
-                int count = config_setting_length( setting );
-                logDebug("type is <list>, of length %d", count );
-                for ( int i = 0; i < count; ++i ) {
-                    importTree( config_setting_get_elem( setting, i ) );
-                }
+            count = config_setting_length( setting );
+            logDebug("type is <list>, of length %d", count );
+            for ( int i = 0; i < count; ++i ) {
+                result = importTree( config_setting_get_elem( setting, i ) );
+                if ( result != 0 ) break;
             }
             break;
 
         default:
             logError( "'watch' must be either a array or list of arrays" );
+            result = -EINVAL;
+            break;
         }
     }
-    return 0;
+
+    return result;
 }
 
 /**
@@ -360,18 +189,16 @@ int processConfigFile( config_t * config, const char * path )
         }
     }
 
-    /* ToDo: loop through any new trees, and add them to our list */
-
     if ( result == 0 ) {
-        importConfig( config );
+        result = importConfig( config );
     }
 
     return result;
 }
 
-tError processConfigFiles( config_t * config, struct arg_file * configFileArg )
+tError processConfigFiles( config_t * config, const struct arg_file * configFileArg )
 {
-    tError result = 0;
+    tError result;
 
     config_init( config );
 
@@ -404,6 +231,27 @@ tError processConfigFiles( config_t * config, struct arg_file * configFileArg )
     return result;
 }
 
+
+/**
+ * @brief tell a daemon process running in the background to exit
+ *
+ * Note: this will be called from another instance invoked with
+ * the --kill option. That's why it's here, and not in events.c
+ *
+ * @return
+ */
+tError terminateDaemon( pid_t pid )
+{
+    tError result = 0;
+    logDebug( "pid: \'%d\'", pid );
+    if ( killpg( pid, SIGTERM ) == -1 ) {
+        logError( "Error: failed to terminate the daemon" );
+        result = -errno;
+    }
+    return result;
+}
+
+
 /**
  * @brief
  * @param argc
@@ -412,7 +260,7 @@ tError processConfigFiles( config_t * config, struct arg_file * configFileArg )
  */
 tError processArgs( int argc, char * argv[] )
 {
-    tError       result = 0;
+    tError       result;
     config_t *   config;
 
     static struct {
@@ -457,19 +305,22 @@ tError processArgs( int argc, char * argv[] )
         return -EINVAL;
     } else {
         if ( option.help->count > 0 ) {  /* special case: '--help' takes precedence over everything else */
-            result =  printUsage( argtable );
+            return printUsage( argtable );
         } else if ( option.killDaemon->count > 0 ) {  /* ditto for '--kill' */
-            result = stopDaemon();
+            return terminateDaemon( getDaemonPID());
         } else if ( option.version->count > 0 ) {     /* and for '--version' */
             fprintf(  stdout, "%s, version %s\n", g.executableName, "(to do)" );
             return 0;
-        } else {
-            config = calloc( 1, sizeof(config_t));
-            if ( config != NULL ) {
-                result = processConfigFiles( config, option.configFile );
+        }
 
-                config_destroy( config );
-            }
+        g.timeout.idle   = 10;
+        g.timeout.rescan = 60;
+
+        config = calloc( 1, sizeof(config_t));
+        if ( config != NULL ) {
+            result = processConfigFiles( config, option.configFile );
+
+            config_destroy( config );
         }
 
         /* release each non-null entry in argtable[] */
@@ -487,7 +338,7 @@ tError processArgs( int argc, char * argv[] )
  */
 tError main( int argc, char * argv[] )
 {
-    tError exitcode = 0;
+    tError result;
 
     g.executableName = strrchr( argv[ 0 ], '/' );
     /* If we found a slash, increment past it. If there's no slash, point at the full argv[0] */
@@ -496,9 +347,15 @@ tError main( int argc, char * argv[] )
     }
     initLogStuff( g.executableName );
 
-    registerHandlers();
+    result = initDaemon();
 
-    exitcode = processArgs( argc, argv );
+    if ( result == 0 ) {
+        result = processArgs( argc, argv );
+    }
 
-    return exitcode;
+    if ( result == 0 ) {
+        result = startDaemon();
+    }
+
+    return result;
 }

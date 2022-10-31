@@ -32,7 +32,12 @@ typedef int		tFileDscr;
 typedef struct {
     const char *  executableName;
 
-    const char *  pidFilename;
+    char *  pidFilename;
+
+    struct {
+        time_t    idle;
+        time_t    rescan;
+    } timeout;
 
     bool          running;
 } tGlobals;

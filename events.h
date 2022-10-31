@@ -13,26 +13,76 @@ typedef enum {
     kRescan = 0, kNew, kModified, kMoved
 } tExpiredAction;
 
-
-
 typedef struct {
     const char *  path;
     size_t    	  pathLen;
     tFileDscr 	  fd;
 } tDir;
 
+typedef enum {
+    kDirectory = 1, // start at 1, reserve 0 to mean 'not set'
+    kFile
+} tFSNodeType;
 
-#if 0
-typedef int tPipe[2];
-enum {
-    kPipeReadFD = 0, kPipeWriteFD = 1
-};
-#endif
+/* circular dependency, so forward-declare tWatchedTree */
+typedef struct nextWatchedTree tWatchedTree;
 
-tError  eventLoop( void );
+typedef struct nextNode {
+    struct nextNode * expiringNext;
 
-int     stopDaemon( void );
+    tWatchedTree *  watchedTree;
 
-tError  watchTree( const char * dir );
+    char *          path;
+    char *          relPath;    /* points within string pointed at 'path' */
+
+    UT_hash_handle  pathHandle;     /* key for the path hash hashmap */
+    UT_hash_handle  watchHandle;    /* key for the watchID hashmap */
+    UT_hash_handle  cookieHandle;   /* key for the cookie hashmap (only used
+                                     * to match up pairs of 'move' events */
+
+    tHash           pathHash;   /* hash of the full path */
+    tWatchID        watchID;    /* the watchID iNotify gave us */
+    tCookie         cookie;     /* only used for the 'move' events */
+
+    time_t          expires;    /* future time when the watchID will have been idle long enough */
+    tExpiredAction  expiredAction; /* why the file was being watched in the first place */
+
+    tFSNodeType     type;
+} tFSNode;
+
+typedef struct nextWatchedTree {
+    struct nextWatchedTree *  next;
+
+    tFSNode * watchHashMap;   // hashmap of the watchID
+    tFSNode * pathHashMap;    // hashmap of the full rootPath, hashed
+    tFSNode * cookieHashMap;  // hashmap of the cookie values (as used for IN_MOVED event pairs
+
+    tFSNode * expiringList;   // linked list ordered by ascending expiration time
+
+    time_t nextRescan;
+
+    struct {
+        tFileDscr   fd;
+    } inotify;
+
+    tDir root;
+    tDir shadow;
+
+    const char * exec;
+
+} tWatchedTree;
+
+
+tError     createTree( const char * dir, const char * exec );
+
+tError     fileExpired( tFSNode * fileNode );
+
+tFSNode *  watchNode( tWatchedTree * watchedTree, const char * fullPath, tFSNodeType type );
+
+pid_t      getDaemonPID( void );
+
+tError     initDaemon( void );
+tError     startDaemon( void );
+void       stopDaemon( void );
 
 #endif //PROCESSNEWFILES__EVENTS_H_
