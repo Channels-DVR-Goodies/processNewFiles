@@ -160,17 +160,23 @@ int processConfigFile( config_t * config, const char * path )
 {
     int result = 0;
 
-    /* Note: this clears the config before populating it */
+    // config_clear( config );
+    int err = config_read_file( config, path );
+    logDebug( "config_read_file \'%s\' returned %d", path, err );
 
-    if ( config_read_file( config, path ) == CONFIG_FALSE ) {
+    if ( err == CONFIG_TRUE ) {
+        result = importConfig( config );
+    } else if ( err == CONFIG_FALSE ) {
         switch ( config_error_type( config ) )
         {
         case CONFIG_ERR_NONE:
-            fprintf(stderr, "no error\n");
+            fprintf(stderr,
+                    "config file \'%s\' not found\n",
+                    path);
             break;
 
         case CONFIG_ERR_FILE_IO:
-            fprintf(stderr, "file I/O error\n");
+            fprintf(stderr, "config file I/O error\n");
             result = -1;
             break;
 
@@ -187,10 +193,8 @@ int processConfigFile( config_t * config, const char * path )
             fprintf( stderr, "unhandled case %s at line %d", __func__, __LINE__);
             break;
         }
-    }
-
-    if ( result == 0 ) {
-        result = importConfig( config );
+    } else {
+        logError( "config_read_file unexpectedly returned %d", err );
     }
 
     return result;
@@ -223,6 +227,7 @@ tError processConfigFiles( config_t * config, const struct arg_file * configFile
 
     if ( result == 0 ) {
         for ( int i = 0; i < configFileArg->count; ++i ) {
+            logDebug( "config file %d: %s", i, configFileArg->filename[ i ] );
             result = processConfigFile( config,
                                         configFileArg->filename[ i ] );
             if ( result != 0 ) break;

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <time.h>
 
 #include "logStuff.h"
 
@@ -25,13 +26,65 @@ const char * gPriorityAsStr[] =
 {
     [kLogEmergency] = "Emergemcy",  /* 0: system is unusable */
     [kLogAlert]	    = "Alert",      /* 1: action must be taken immediately */
-    [kLogCritical]	= "Critical",   /* 2: critical conditions */
+    [kLogCritical]  = "Critical",   /* 2: critical conditions */
     [kLogError]	    = "Err",        /* 3: error conditions */
-    [kLogWarning]	= "Warning",    /* 4: warning conditions */
-    [kLogNotice]	= "Notice",     /* 5: normal but significant condition */
-    [kLogInfo]	    = "Info",       /* 6: informational */
-    [kLogDebug]	    = "Debug",      /* 7: debug-level messages */
+    [kLogWarning]   = "Wrn",    /* 4: warning conditions */
+    [kLogNotice]    = "Not",     /* 5: normal but significant condition */
+    [kLogInfo]	    = "Inf",       /* 6: informational */
+    [kLogDebug]	    = "Dbg",      /* 7: debug-level messages */
     [kLogFunctions] = ""            /* function call output */
+};
+
+typedef enum {
+    kColorBlack    = 0,
+    kColorRed      = 1,
+    kColorGreen    = 2,
+    kColorYellow   = 3,
+    kColorBlue     = 4,
+    kColorMagenta  = 5,
+    kColorCyan     = 6,
+    kColorWhite    = 7,
+    kColorReset,
+    kColorNop
+} eANSIColor;
+
+const char * gSetColor[] = {
+    [kColorBlack]    = "\e[1;40m",
+    [kColorRed]      = "\e[1;41m",
+    [kColorGreen]    = "\e[1;42m",
+    [kColorYellow]   = "\e[1;43m",
+    [kColorBlue]     = "\e[1;44m",
+    [kColorMagenta]  = "\e[1;45m",
+    [kColorCyan]     = "\e[1;46m",
+    [kColorWhite]    = "\e[1;47m",
+    [kColorReset]    = "\e[1;0m",
+    [kColorNop]      = "",
+};
+
+eANSIColor gPrioritySetColor[] =
+{
+   [kLogEmergency]  = kColorRed,       /* 0: system is unusable */
+   [kLogAlert]      = kColorRed,       /* 1: action must be taken immediately */
+   [kLogCritical]   = kColorRed,       /* 2: critical conditions */
+   [kLogError]      = kColorRed,       /* 3: error conditions */
+   [kLogWarning]    = kColorYellow,    /* 4: warning conditions */
+   [kLogNotice]     = kColorGreen,     /* 5: normal but significant condition */
+   [kLogInfo]       = kColorGreen,     /* 6: informational */
+   [kLogDebug]      = kColorNop,       /* 7: debug-level messages */
+   [kLogFunctions]  = kColorNop        /* function call output */
+};
+
+eANSIColor gPriorityResetColor[] =
+{
+   [kLogEmergency]  = kColorReset,     /* 0: system is unusable */
+   [kLogAlert]      = kColorReset,     /* 1: action must be taken immediately */
+   [kLogCritical]   = kColorReset,     /* 2: critical conditions */
+   [kLogError]      = kColorReset,     /* 3: error conditions */
+   [kLogWarning]    = kColorReset,     /* 4: warning conditions */
+   [kLogNotice]     = kColorReset,     /* 5: normal but significant condition */
+   [kLogInfo]       = kColorReset,     /* 6: informational */
+   [kLogDebug]      = kColorNop,       /* 7: debug-level messages */
+   [kLogFunctions]  = kColorNop        /* function call output */
 };
 
 struct {
@@ -89,9 +142,20 @@ void _logToTheVoid( eLogPriority UNUSED(priority), const char * UNUSED(msg))  { 
 
 void _logToSyslog( eLogPriority priority, const char * msg )         { syslog( priority, "%s", msg ); }
 
-void _logToFile( eLogPriority UNUSED(priority), const char *msg )    { fprintf(gLogFile, "%s\n", msg); }
+void _logToFile( eLogPriority UNUSED(priority), const char *msg )
+{
+    fprintf(gLogFile, "%lu: %s\n", time( NULL ), msg );
+}
 
-void _logToStderr( eLogPriority UNUSED(priority), const char *msg )  { fprintf(stderr, "%s\n", msg); }
+/* stderr is has colored output */
+void _logToStderr( eLogPriority priority, const char *msg )
+{
+    fprintf(stderr, "%lu: %s%s%s\n",
+            time( NULL ),
+            gSetColor[ gPrioritySetColor[ priority ] ],
+            msg,
+            gSetColor[ gPriorityResetColor[ priority ] ] );
+}
 
 /* use function pointers to invoke the logging destination */
 typedef void (*fpLogTo)( unsigned int priority, const char * msg );
@@ -126,7 +190,9 @@ void _log( const char *inPath,
         /* if the destination isn't syslog, prefix the message with the priority */
         if ( priority <= kLogDebug && gLogSetting[priority].destination != kLogToSyslog)
         {
-            prefixLen = snprintf( msg, sizeof( msg ), "%s: ", gPriorityAsStr[ priority ] );
+            prefixLen = snprintf( msg, sizeof( msg ), "%s [%d]: ",
+                                  gPriorityAsStr[ priority ],
+                                  getpid() );
         }
 
         prefixLen += vsnprintf( &msg[ prefixLen ], sizeof( msg ) - prefixLen, format, vaptr );
@@ -142,7 +208,9 @@ void _log( const char *inPath,
             const char * inFile = strrchr(inPath, '/');
             if ( inFile++ == NULL )
             { inFile = inPath; }
-            snprintf( &msg[ prefixLen ], sizeof( msg ) - prefixLen, " @ %s:%d", inFile, atLine );
+            prefixLen += snprintf( &msg[ prefixLen ],
+                                   sizeof( msg ) - prefixLen,
+                                   " @ %s:%d", inFile, atLine );
         }
 
         ( gLogOutputFP[ gLogSetting[ priority ].destination ] )( priority, msg );
@@ -150,6 +218,7 @@ void _log( const char *inPath,
         va_end( vaptr );
     }
 }
+
 
 void initLogStuff( const char * name )
 {

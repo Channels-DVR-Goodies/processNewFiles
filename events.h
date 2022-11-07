@@ -10,8 +10,8 @@ typedef int         tWatchID;
 typedef int         tNFTWresult;
 
 typedef enum {
-    kRescan = 0, kNew, kModified, kMoved
-} tExpiredAction;
+    kUnmonitored = 0, kFirstSeen, kModified, kMoved, kRetry
+} tExpiredReason;
 
 typedef struct {
     const char *  path;
@@ -33,19 +33,21 @@ typedef struct nextNode {
     tWatchedTree *  watchedTree;
 
     char *          path;
-    char *          relPath;    /* points within string pointed at 'path' */
+    char *          relPath;        /* points within string pointed at 'path' */
 
     UT_hash_handle  pathHandle;     /* key for the path hash hashmap */
     UT_hash_handle  watchHandle;    /* key for the watchID hashmap */
     UT_hash_handle  cookieHandle;   /* key for the cookie hashmap (only used
                                      * to match up pairs of 'move' events */
 
-    tHash           pathHash;   /* hash of the full path */
-    tWatchID        watchID;    /* the watchID iNotify gave us */
-    tCookie         cookie;     /* only used for the 'move' events */
+    tHash           pathHash;       /* hash of the full path */
+    tWatchID        watchID;        /* the watchID iNotify gave us */
+    tCookie         cookie;         /* only used for the 'move' events */
 
-    time_t          expires;    /* future time when the watchID will have been idle long enough */
-    tExpiredAction  expiredAction; /* why the file was being watched in the first place */
+    time_t         expires;        /* future time when the watchID will have been idle long enough */
+    time_t         idlePeriod;     /* keep track of how many times we've tried & failed to process this */
+    tExpiredReason expiredReason;  /* why the file was being watched in the first place */
+    int            retries;        /* keep track of how many times we've tried & failed to process this */
 
     tFSNodeType     type;
 } tFSNode;

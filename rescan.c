@@ -41,7 +41,7 @@ tNFTWresult scanFileNode( tWatchedTree *      watchedTree,
             {
             case ENOENT: /* shadow file does not exist, so create a fresh file node */
                 watchNode( watchedTree, fullPath, kFile );
-                status = "new";
+                status = "first seen";
                 break;
 
             default: /* everything else is unexpected */
@@ -52,9 +52,8 @@ tNFTWresult scanFileNode( tWatchedTree *      watchedTree,
             if ( S_ISREG( fileInfo.st_mode ) )
             {
                 if ( fileInfo.st_mode & (S_IXUSR | S_IXGRP) ) {
-                    /* shadow file is *already* present and executable.
-                     * previous processing must have been interrupted. */
-                    status = "recover";
+                    /* shadow file is *already* present and executable */
+                    status = "retry";
                 } else {
                     status = "seen";
                 }
@@ -62,7 +61,7 @@ tNFTWresult scanFileNode( tWatchedTree *      watchedTree,
                 logError( "the shadow file \'%s/%s\' is not a regular file", watchedTree->shadow.path, relPath );
             }
         }
-        logDebug( "%d%-*c file: %s (%s)", ftwbuf->level, ftwbuf->level * 4, ':', relPath, status );
+//        logDebug( "%d%-*c file: %s (%s)", ftwbuf->level, ftwbuf->level * 4, ':', relPath, status );
     }
 
     return FTW_CONTINUE;
@@ -88,10 +87,12 @@ tNFTWresult scanDirNode( tWatchedTree *      watchedTree,
         result = FTW_CONTINUE;
 
         const char * relPath = &fullPath[ watchedTree->root.pathLen ];
+#if 0
         logDebug( "%d%-*c  dir: %s",
                   ftwbuf->level,
                   ftwbuf->level * 4, ':',
                   relPath );
+#endif
 
         /* make sure that the corresponding shadow directory exists */
         if ( strlen( relPath ) > 0 ) {
@@ -157,6 +158,14 @@ tError rescanTree( tWatchedTree * watchedTree )
     int result = 0;
 
     if ( watchedTree != NULL ) {
+
+#ifdef DEBUG
+    for( tFSNode * node = watchedTree->expiringList; node != NULL; node = node->expiringNext )
+    {
+        logDebug("%s %ld", node->relPath, node->expires - time( NULL ) );
+    }
+#endif
+
         gWatchedTree = watchedTree;
 
         result = nftw( watchedTree->root.path, scanNode, 12, FTW_ACTIONRETVAL | FTW_MOUNT );
