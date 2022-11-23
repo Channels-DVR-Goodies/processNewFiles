@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define  _GNU_SOURCE  /* dladdr is a gcc extension */
+#endif
 
 #include <unistd.h>
 #include <stdio.h>
@@ -20,6 +22,10 @@
 # define UNUSED(x) /*@unused@*/ x
 #else
 # define UNUSED(x) (void)x
+#endif
+
+#ifdef __cplusplus
+extern "C" {
 #endif
 
 const char * gPriorityAsStr[] =
@@ -102,7 +108,7 @@ void *          gDLhandle = NULL;
 tBool           gFunctionTraceEnabled = off;
 int             gCallDepth = 1;
 
-static char *leader = "..........................................................................................";
+static const char *leader = "..........................................................................................";
 
 #ifdef __GNUC__
 #define DISABLE_FUNCTION_INSTRUMENTATION  __attribute__((no_instrument_function))
@@ -112,14 +118,15 @@ static char *leader = ".........................................................
 
 /* {{{{{{{{ DO NOT INSTRUMENT THE INSTRUMENTATION! {{{{{{{{ */
 
+
 void initLogStuff( const char *name )    DISABLE_FUNCTION_INSTRUMENTATION;
 
 void _log( const char * inFile,
            unsigned int atLine,
            const char * inFunction,
            error_t      error,
-           unsigned int priority,
-           const char *format, ... )    DISABLE_FUNCTION_INSTRUMENTATION;
+           eLogPriority priority,
+           const char * format, ... )    DISABLE_FUNCTION_INSTRUMENTATION;
 
 void _logToTheVoid( eLogPriority priority, const char *msg )   DISABLE_FUNCTION_INSTRUMENTATION;
 void _logToSyslog(  eLogPriority priority, const char *msg )   DISABLE_FUNCTION_INSTRUMENTATION;
@@ -131,8 +138,8 @@ void _profileHelper( void *leftAddr, const char *middle, void *rightAddr )  DISA
 const char * addressToString( void * addr, char * scratch )    DISABLE_FUNCTION_INSTRUMENTATION;
 
 #ifdef __GNUC__
-void __cyg_profile_func_enter( void *this_fn, void *call_site )     DISABLE_FUNCTION_INSTRUMENTATION;
-void __cyg_profile_func_exit( void *this_fn, void *call_site )      DISABLE_FUNCTION_INSTRUMENTATION;
+void __cyg_profile_func_enter( void * this_fn, void * call_site )     DISABLE_FUNCTION_INSTRUMENTATION;
+void __cyg_profile_func_exit( void * this_fn, void * call_site )      DISABLE_FUNCTION_INSTRUMENTATION;
 #endif
 
 /* }}}}}}}} DO NOT INSTRUMENT THE INSTRUMENTATION! }}}}}}}} */
@@ -158,7 +165,7 @@ void _logToStderr( eLogPriority priority, const char *msg )
 }
 
 /* use function pointers to invoke the logging destination */
-typedef void (*fpLogTo)( unsigned int priority, const char * msg );
+typedef void (*fpLogTo)( eLogPriority priority, const char * msg );
 fpLogTo gLogOutputFP[kLogMaxDestination] =
 {
     [kLogToTheVoid] = &_logToTheVoid,
@@ -175,7 +182,7 @@ void _log( const char *inPath,
            unsigned int atLine,
            const char * UNUSED(inFunction),
            error_t error,
-           unsigned int priority,
+           eLogPriority priority,
            const char *format, ...)
 {
     va_list vaptr;
@@ -373,5 +380,9 @@ void logFunctionTrace( tBool onOff )
 {
     gFunctionTraceEnabled = onOff;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

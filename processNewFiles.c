@@ -202,26 +202,33 @@ int processConfigFile( config_t * config, const char * path )
 
 tError processConfigFiles( config_t * config, const struct arg_file * configFileArg )
 {
-    tError result;
+    tError result = 0;
 
     config_init( config );
 
     config_set_options( config, CONFIG_OPTION_ALLOW_OVERRIDES );
 
-    char * configFile;
+    char * configFile = NULL;
 
-    asprintf( &configFile, "/etc/%s.conf", g.executableName );
-    result = processConfigFile( config, configFile );
-    free( configFile );
+    if ( asprintf( &configFile, "/etc/%s.conf", g.executableName ) < 1 ) {
+        logError( "failed to generate path to default config in /etc" );
+    } else {
+        result = processConfigFile( config, configFile );
+    }
+    if ( configFile != NULL ) free( configFile );
 
     if ( result == 0 ) {
         const char * home = getenv( "HOME" );
         if ( home != NULL ) {
-            asprintf( &configFile,
-                      "%s/.config/%s.conf",
-                      home, g.executableName );
-            result = processConfigFile( config, configFile );
-            free( configFile );
+            configFile = NULL;
+            if ( asprintf( &configFile,
+                            "%s/.config/%s.conf",
+                            home, g.executableName ) < 1 ) {
+                logError( "unable to generate path to user's config file" );
+            } else {
+                result = processConfigFile( config, configFile );
+            }
+            if ( configFile != NULL) free( configFile );
         }
     }
 
@@ -321,7 +328,7 @@ tError processArgs( int argc, char * argv[] )
         g.timeout.idle   = 10;
         g.timeout.rescan = 60;
 
-        config = calloc( 1, sizeof(config_t));
+        config = (config_t *)calloc( 1, sizeof(config_t));
         if ( config != NULL ) {
             result = processConfigFiles( config, option.configFile );
 

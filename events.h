@@ -20,7 +20,8 @@ typedef struct {
 } tDir;
 
 typedef enum {
-    kDirectory = 1, // start at 1, reserve 0 to mean 'not set'
+    kUnsetNodeType = 0,
+    kDirectory, // start at 1, reserve 0 to mean 'not set'
     kFile
 } tFSNodeType;
 

@@ -46,61 +46,72 @@ static struct {
     tWatchedTree *  treeList;
 } gEvent;
 
-const char * fsTypeAsStr[] = {
-    [kFile]      = "file",
-    [kDirectory] = "directory"
-};
-
-
-struct {
-    int mask;
-    const char * label;
-} iNotifyFlags[] = {
-    { IN_ACCESS,       "Access" },        /* File was accessed.  */
-    { IN_MODIFY,       "Modify" },        /* File was modified.  */
-    { IN_ATTRIB,       "Attrib" },        /* Metadata changed.  */
-    { IN_CLOSE_WRITE,  "Close_Write" },   /* File opened for writing was closed.  */
-    { IN_CLOSE_NOWRITE,"Close_NoWrite" }, /* File opened for reading was closed.  */
-    { IN_OPEN,         "Open" },          /* File was opened.  */
-    { IN_MOVED_FROM,   "Moved_From" },    /* File was moved from <src>.  */
-    { IN_MOVED_TO,     "Moved_To" },      /* File was moved to <dest>.  */
-    { IN_CREATE,       "Create" },        /* File was created in dir.  */
-    { IN_DELETE,       "Delete" },        /* File was deleted from dir.  */
-    { IN_DELETE_SELF,  "Delete_Self" },   /* Self was deleted.  */
-    { IN_MOVE_SELF,    "Move_Self" },     /* Self was moved.  */
-    /* Flags set by kernel */
-    { IN_UNMOUNT,      "Unmount" },       /* Backing fs was unmounted.  */
-    { IN_Q_OVERFLOW,   "Q_Overflow" },    /* Event queued overflowed.  */
-    { IN_IGNORED,      "Ignored" },       /* File was ignored.  */
-    { IN_ISDIR,        "IsDir" },         /* Event refers to a directory */
-    /* end of table */
-    { 0, NULL }
+const char * const fsTypeAsStr[] = {
+    [kUnsetNodeType] = "(unset)",
+    [kDirectory]     = "directory",
+    [kFile]          = "file"
 };
 
 
 /**
  * @brief
  * @param buffer
- * @param remaining
+ * @param bufferSize
  * @param event
  * @return
  */
-size_t inotifyEventTypeAsStr( char * buffer, size_t remaining, const struct inotify_event * event )
+const char * inotifyEventTypeAsStr( const struct inotify_event * event )
 {
-    buffer[ 0 ] = '\0';
+
+    static struct {
+        int mask;
+        const char * label;
+    } iNotifyFlags[] = {
+        { IN_ACCESS,       "Access" },        /* File was accessed.  */
+        { IN_MODIFY,       "Modify" },        /* File was modified.  */
+        { IN_ATTRIB,       "Attrib" },        /* Metadata changed.  */
+        { IN_CLOSE_WRITE,  "Close_Write" },   /* File opened for writing was closed.  */
+        { IN_CLOSE_NOWRITE,"Close_NoWrite" }, /* File opened for reading was closed.  */
+        { IN_OPEN,         "Open" },          /* File was opened.  */
+        { IN_MOVED_FROM,   "Moved_From" },    /* File was moved from <src>.  */
+        { IN_MOVED_TO,     "Moved_To" },      /* File was moved to <dest>.  */
+        { IN_CREATE,       "Create" },        /* File was created in dir.  */
+        { IN_DELETE,       "Delete" },        /* File was deleted from dir.  */
+        { IN_DELETE_SELF,  "Delete_Self" },   /* Self was deleted.  */
+        { IN_MOVE_SELF,    "Move_Self" },     /* Self was moved.  */
+        /* Flags set by kernel */
+        { IN_UNMOUNT,      "Unmount" },       /* Backing fs was unmounted.  */
+        { IN_Q_OVERFLOW,   "Q_Overflow" },    /* Event queued overflowed.  */
+        { IN_IGNORED,      "Ignored" },       /* File was ignored.  */
+        { IN_ISDIR,        "IsDir" },         /* Event refers to a directory */
+        /* mark the end of the table */
+        { 0, NULL }
+    };
+
+
+    size_t bufferSize = 1;  /* for the trailing null */
+    for ( int i          = 0; iNotifyFlags[ i ].mask != 0; ++i ) {
+        if ( event->mask & iNotifyFlags[ i ].mask ) {
+            bufferSize += strlen( iNotifyFlags[ i ].label ) + sizeof(" | ");
+        }
+    }
+
+    char * buffer = (char *)calloc( 1, bufferSize );
+
+    if ( buffer == NULL ) return NULL;
 
     bool needSeparator = false;
     for ( int i = 0; iNotifyFlags[ i ].mask != 0; ++i ) {
         if ( event->mask & iNotifyFlags[ i ].mask ) {
             if ( needSeparator ) {
-                strncat( buffer, " | ", remaining );
+                strncat( buffer, " | ", bufferSize );
             }
-            strncat( buffer, iNotifyFlags[ i ].label, remaining );
+            strncat( buffer, iNotifyFlags[ i ].label, bufferSize );
             needSeparator = true;
         }
     }
 
-    return remaining;
+    return buffer;
 }
 
 
@@ -111,38 +122,50 @@ size_t inotifyEventTypeAsStr( char * buffer, size_t remaining, const struct inot
  * @param watchedTree
  * @param fsNode
  */
-void fsNodeAsStr( char * buffer, size_t remaining, const tFSNode * fsNode )
+const char * fsNodeAsStr( const tFSNode * fsNode )
 {
+    char * result = NULL;
+
+    const char * emptyStr = "";
     /* Print the name of the watched node */
     if ( fsNode != NULL )
     {
-        char cookieStr[ 32 ];
-        cookieStr[ 0 ] = '\0';
+        const char * cookieStr = emptyStr;
         if ( fsNode->cookie != 0 ) {
-            snprintf( cookieStr, sizeof( cookieStr ), " {%u}", fsNode->cookie );
+            if ( asprintf( (char **)&cookieStr, " {%u}", fsNode->cookie ) < 1 ) {
+                logError( "unable to generate cookie message");
+            }
         }
 
-        char expiresStr[ 32 ];
-        expiresStr[ 0 ] = '\0';
+        const char * expiresStr = emptyStr;
         if ( fsNode->expires != 0 )
         {
-            snprintf( expiresStr, sizeof( expiresStr ),
-                      " expires in %lu secs",
-                      fsNode->expires - time(NULL ) );
+            if ( asprintf( (char **)&expiresStr,
+                            " expires in %lu secs",
+                            fsNode->expires - time(NULL ) ) < 1 ) {
+                logDebug( "unable to generate timeout message" );
+            }
         }
 
-        snprintf( buffer, remaining,
-                  "%s [%02d] \'%s\'%s %s%s",
-                  fsTypeAsStr[ fsNode->type ],
-                  fsNode->watchID,
-                  fsNode->path,
-                  cookieStr,
-                  expiredReasonAsStr[ fsNode->expiredReason ],
-                  expiresStr );
+        if ( asprintf( &result,
+                        "%s [%02d] \'%s\'%s %s%s",
+                        fsTypeAsStr[ fsNode->type ],
+                        fsNode->watchID,
+                        fsNode->path,
+                        cookieStr,
+                        expiredReasonAsStr[ fsNode->expiredReason ],
+                        expiresStr ) < 1 ) {
+            logDebug( "unable to generate debug message" );
+        }
+
+        if ( cookieStr  != emptyStr ) free( (void *)cookieStr );
+        if ( expiresStr != emptyStr ) free( (void *)expiresStr );
     }
+
+    return result;
 }
 
-
+#if 1
 /**
  * @brief
  * @param watchedTree
@@ -150,13 +173,13 @@ void fsNodeAsStr( char * buffer, size_t remaining, const tFSNode * fsNode )
  */
 void logFsNode( const tFSNode * fsNode )
 {
-    char   buffer[PATH_MAX + 128];
+    const char * buffer;
 
-    size_t remaining = sizeof( buffer );
-    fsNodeAsStr( buffer, remaining, fsNode );
+    buffer = fsNodeAsStr( fsNode );
     logDebug( "%s", buffer );
+    free( (void *)buffer );
 }
-
+#endif
 
 /**
  * @brief
@@ -170,25 +193,24 @@ void logEvent( const struct inotify_event * event, const tFSNode * watchedNode )
     /* don't log directory events. it's just extra noise at this point. */
     if ( event != NULL && !(event->mask & IN_ISDIR) )
     {
-        char eventTypeStr[42];
-
         /* display event type. */
-        inotifyEventTypeAsStr( eventTypeStr, sizeof( eventTypeStr ) - 1, event );
+        const char * eventTypeStr = inotifyEventTypeAsStr( event );
 
-        char cookieStr[32];
-        cookieStr[ 0 ] = '\0';
-        if ( event->cookie != 0 ) {
-            snprintf( cookieStr, sizeof( cookieStr ), " (%u)", event->cookie );
+        char * cookieStr = NULL;
+        if ( asprintf( &cookieStr, " (%u)", event->cookie ) < 1 ) {
+            logDebug( "unable to generate debug message" );
+        }
+        if ( event->cookie == 0 ) {
+            cookieStr[0] = '\0';
         }
 
         /* the name of the file, if any. */
-        const char * nameStr = "";
-        if ( event->len > 0 ) {
-            nameStr = event->name;
+        const char * nameStr = event->name;
+        if ( event->len == 0 ) {
+            nameStr = "";
         }
 
-        char nodeStr[PATH_MAX];
-        nodeStr[ 0 ] = '\0';
+        const char * nodeStr = NULL;
 
         const tWatchedTree * watchedTree = watchedNode->watchedTree;
         if ( watchedTree != NULL ) {
@@ -197,10 +219,13 @@ void logEvent( const struct inotify_event * event, const tFSNode * watchedNode )
             if ( fsNode == NULL ) {
                 logError( "Error: watchID [%02d] not found", event->wd );
             } else {
-                fsNodeAsStr( nodeStr, sizeof( nodeStr ), watchedNode );
+                nodeStr = fsNodeAsStr( watchedNode );
             }
         }
         logDebug( "[%02u] %-32s %-8s %s (%s)", event->wd, eventTypeStr, cookieStr, nodeStr, nameStr );
+
+        free( (void *)eventTypeStr );
+        free( (void *)nodeStr );
     }
 #endif
 }
@@ -374,7 +399,7 @@ tFSNode * watchNode( tWatchedTree * watchedTree, const char * fullPath, tFSNodeT
     tFSNode * fsNode = fsNodeFromPath( watchedTree, fullPath );
 
     if ( fsNode == NULL ) {
-        fsNode = calloc( 1, sizeof( tFSNode ));
+        fsNode = (tFSNode *)calloc( 1, sizeof( tFSNode ) );
         fsNode->watchedTree = watchedTree;
         fsNode->type        = type;
         fsNode->path        = strdup( fullPath );
@@ -398,14 +423,22 @@ tFSNode * watchNode( tWatchedTree * watchedTree, const char * fullPath, tFSNodeT
                 HASH_ADD( watchHandle, watchedTree->watchHashMap, watchID, sizeof( tWatchID ), fsNode );
             }
             break;
+
+        default:
+            break;
         }
 
-//        logFsNode( fsNode );
+        logFsNode( fsNode );
     }
 
     return fsNode;
 }
 
+#if 0
+/**
+ * @brief
+ * @param fsNode
+ */
 void freeNode( tFSNode * fsNode )
 {
     if (fsNode != NULL ) {
@@ -415,6 +448,7 @@ void freeNode( tFSNode * fsNode )
         free( fsNode );
     }
 }
+#endif
 
 /**
  * @brief destroy a fsNode and remove any references to it
@@ -470,6 +504,11 @@ void removeNode( tFSNode * fsNode )
     forgetNode( fsNode );
 }
 
+/**
+ * @brief
+ * @param fileNode
+ * @return
+ */
 tError retryFileNode( tFSNode * fileNode )
 {
     tError result = 1;
@@ -492,13 +531,17 @@ tError retryFileNode( tFSNode * fileNode )
                   fileNode->retries,
                   fileNode->relPath,
                   fileNode->idlePeriod );
-        /* put it back onto the expire list to try again */
+        /* put it back onto the expireList to try again */
         resetExpiration( fileNode, kRetry );
     }
     return result;
 }
 
-void markFileComplete( const tFSNode * fileNode )
+/**
+ * @brief
+ * @param fileNode
+ */
+void markFileComplete( tFSNode * fileNode )
 {
     const tWatchedTree * watchedTree = fileNode->watchedTree;
 
@@ -510,6 +553,8 @@ void markFileComplete( const tFSNode * fileNode )
      * file isn't new, so also do it explicitly */
     fchmod( fd, S_IRUSR | S_IRGRP );
     close( fd );
+
+    forgetNode( fileNode );
     /* ToDo: free the fileNode */
 }
 
@@ -528,17 +573,13 @@ tError execFileNode( tFSNode * fileNode )
     logDebug( "### execute %s", fileNode->path );
 
     /* ToDo: Actually execute it */
-    result = -1;
+    result = ( fileNode->retries < 3 )? -1 : 0 ;
 
     if (result == 0) {
         /* processing completed without error, so adjust the shadow file accordingly */
         markFileComplete( fileNode );
     } else {
         result = retryFileNode( fileNode );
-        if ( result == 0 || result == -ENOTRECOVERABLE ) {
-            /* otherwise it'll never end... */
-            markFileComplete( fileNode );
-        }
     }
     return result;
 }
@@ -556,32 +597,34 @@ tError fileExpired( tFSNode * fileNode )
 
     logDebug( "\'%s\' %s, and has expired", fileNode->path, expiredReasonAsStr[ fileNode->expiredReason ] );
 
+    /* remove any existing shadow file */
+    if ( unlinkat( watchedTree->shadow.fd, fileNode->relPath, 0 ) == -1 && errno != ENOENT ) {
+        logError( "unable to remove shadow file \'%s\'", fileNode->relPath );
+    }
+    /* create a fresh shadow file */
     int fd = openat( watchedTree->shadow.fd, fileNode->relPath, O_WRONLY | O_CREAT | O_TRUNC, S_IRWXU );
     if ( fd == -1 ) {
         result = -errno;
         logError( "unable to create shadow file \'%s%s\'", watchedTree->shadow.path, fileNode->relPath );
     } else {
         char * buffer;
-        /* If the shadow file already exists, e.g. a file that was previously
-         * processed and thus is already R/O, and is then written to again,
-         * then the openat() above won't have affected the shadow file's perms.
-         * So also do it explicitly. */
-        fchmod( fd, S_IRWXU );
 
-        asprintf( &buffer, "#!/bin/bash\nFILE=\'%s\'\nREASON=\'%s\'\n%s\n",
-                  fileNode->path,
-                  expiredReasonAsStr[ fileNode->expiredReason ],
-                  watchedTree->exec );
-        write( fd, buffer, strlen( buffer ));
+        if ( asprintf( &buffer, "#!/bin/bash\nFILE=\'%s\'\nREASON=\'%s\'\n%s\n",
+                        fileNode->path,
+                        expiredReasonAsStr[ fileNode->expiredReason ],
+                        watchedTree->exec ) < 1 ) {
+            logDebug( "unable to generate script contents" );
+        }
+        int len = strlen( buffer );
+        if ( write( fd, buffer, len) < len ) {
+            logError( "unable to write script contents" );
+        }
         free( buffer );
         close( fd );
 
-        forgetNode( fileNode );
-
-        result = execFileNode( fileNode );
-
+        result = 0; execFileNode( fileNode );
     }
-    result = 0;
+
     return result;
 }
 
@@ -619,13 +662,17 @@ tError processExpiredFSNodes( void )
           watchedTree = watchedTree->next )
     {
         tFSNode * fsNode;
-        while ( result == 0
-            && ( fsNode = watchedTree->expiringList) != NULL
-            && fsNode->expires <= now)
+        while ( (fsNode = watchedTree->expiringList) != NULL
+                 && fsNode->expires <= now)
         {
-            /* this will always the 'expired' node at the head of the
-             * 'expiringList', hence the unusual loop construct */
+            /* remove the first item on the expiringList... */
+            watchedTree->expiringList = fsNode->expiringNext;
+
+            /* ..because it expired */
             result = fileExpired( fsNode );
+
+            /* if there was a problem, exit the loop */
+            if (result != 0) break;
         }
     }
     return result;
@@ -663,6 +710,7 @@ void doiNotifyCreate( tFSNode * pathNode,
                       const struct inotify_event * event,
                       const char * fullPath )
 {
+    (void) event; (void) fullPath;
     if ( pathNode->type == kFile ) {
         /* start the idle timer */
         resetExpiration( pathNode, kFirstSeen );
@@ -808,7 +856,9 @@ tError processOneInotifyEvent( tWatchedTree * watchedTree, const struct inotify_
      */
     char * fullPath;
     if ( event->len > 0 ) {
-        asprintf( &fullPath, "%s/%s", watchedNode->path, event->name );
+        if ( asprintf( &fullPath, "%s/%s", watchedNode->path, event->name ) < 1 ) {
+            logDebug( "unable to generate full path" );
+        }
     } else {
         fullPath = strdup( watchedNode->path );
     }
@@ -963,7 +1013,9 @@ tError makeShadowDir( tWatchedTree * watchedTree )
 {
     tError result = 0;
 
-    asprintf( (char **)&(watchedTree->shadow.path), "%s.seen/", watchedTree->root.path );
+    if ( asprintf( (char **)&(watchedTree->shadow.path), "%s.seen/", watchedTree->root.path ) < 1 ) {
+        logError( "failed to generate path to shadow directory" );
+    }
     if (watchedTree->shadow.path != NULL ) {
         watchedTree->shadow.pathLen = strlen( watchedTree->shadow.path );
 
@@ -1002,22 +1054,20 @@ tError openRootDir( tWatchedTree * watchedTree, const char * dir )
         if ( stat( rootPath, &fileInfo ) == -1 ) {
             result = -errno;
             logError( "couldn't get info about %s", watchedTree->root.path );
-        } else {
-            if ( S_ISDIR( fileInfo.st_mode ) ) {
-                size_t len = strlen( rootPath );
-                rootPath = realloc( rootPath, len + 2 );
-                rootPath[len++] = '/';
-                rootPath[len]   = '\0';
-                watchedTree->root.path    = rootPath;
-                watchedTree->root.pathLen = len;
+        } else if ( S_ISDIR( fileInfo.st_mode ) ) {
+            size_t len = strlen( rootPath );
+            rootPath = (char *)realloc( rootPath, len + 2 );
+            rootPath[len++] = '/';
+            rootPath[len]   = '\0';
+            watchedTree->root.path    = rootPath;
+            watchedTree->root.pathLen = len;
 
-                logDebug( "absolute root.path is \'%s\'", watchedTree->root.path );
+            logDebug( "absolute root.path is \'%s\'", watchedTree->root.path );
 
-                watchedTree->root.fd = open( watchedTree->root.path, O_DIRECTORY );
-                if ( watchedTree->root.fd < 0 ) {
-                    logError( "couldn't open the root directory \'%s\'", watchedTree->root.path );
-                    result = -errno;
-                }
+            watchedTree->root.fd = open( watchedTree->root.path, O_DIRECTORY );
+            if ( watchedTree->root.fd < 0 ) {
+                logError( "couldn't open the root directory \'%s\'", watchedTree->root.path );
+                result = -errno;
             }
         }
     }
@@ -1115,7 +1165,7 @@ tError createTree( const char * dir, const char * exec )
 
     if ( dir == NULL ) return -EINVAL;
 
-    tWatchedTree * watchedTree = calloc( 1, sizeof( tWatchedTree ));
+    tWatchedTree * watchedTree = (tWatchedTree *)calloc( 1, sizeof( tWatchedTree ));
     if ( watchedTree == NULL ) {
         result = -ENOMEM;
     } else {
@@ -1164,13 +1214,17 @@ tError createPidFile( pid_t pid )
 
     if ( g.pidFilename == NULL ) {
         char * pidDir;
-        asprintf( &pidDir, "/tmp/%s", g.executableName );
+        if ( asprintf( &pidDir, "/tmp/%s", g.executableName ) < 1 ) {
+            logError( "unable to create the PID filename" );
+        }
         if ( mkdir( pidDir, S_IRWXU) == -1 && errno != EEXIST ) {
             result = -errno;
             logError( "Error: unable to create directory %s", pidDir );
         } else {
-            asprintf( &g.pidFilename,"/tmp/%s/%s.pid",
-                      g.executableName, g.executableName );
+            if ( asprintf( &g.pidFilename,"/tmp/%s/%s.pid",
+                           g.executableName, g.executableName ) < 1 ) {
+                logError( "unable to generate path to pid file" );
+            }
         }
         free( pidDir );
     }
@@ -1202,14 +1256,21 @@ pid_t getDaemonPID( void )
 
     FILE * pidFile = fopen( g.pidFilename, "r" );
     if ( pidFile == NULL ) {
+        result = -errno;
         logError( "Error: unable to open %s for reading",
                   g.pidFilename );
-        result = -errno;
     } else {
-        if ( fscanf( pidFile, "%d", &result ) == -1 || result == 0 ) {
-            logError( "Error: unable to read pid from %s",
-                      g.pidFilename );
+        char pidStr[ 32 ];
+        char * pidPtr = fgets( pidStr, sizeof(pidStr), pidFile );
+        if ( pidPtr == NULL ) {
             result = -errno;
+            logError( "unable to read pid from %s", g.pidFilename );
+        } else {
+            result = (pid_t)strtoul( pidStr, &pidPtr, 10 );
+            if ( *pidPtr != '\0' ) {
+                result = -EINVAL;
+                logError( "unable convert %s to an integer", pidStr );
+            }
         }
         fclose( pidFile );
     }
@@ -1295,7 +1356,9 @@ tError eventLoop( void )
 void stopDaemon( void )
 {
     logCheckpoint();
-    write( gEvent.pipe.exitLoop[kWriteEnd], "!", 1 );
+    if ( write( gEvent.pipe.exitLoop[kWriteEnd], "!", 1 ) < 1) {
+        logError( "unable to stop daemon" );
+    }
 }
 
 
@@ -1318,15 +1381,19 @@ void daemonSignal( int signum )
 
 #ifdef DEBUG
     const char * signalAsStr[] = {
+        [0]       = NULL,
         [SIGHUP]  = "Hangup",
         [SIGINT]  = "Interactive attention signal",
         [SIGQUIT] = "Quit",
         [SIGILL]  = "Illegal instruction",
         [SIGTRAP] = "Trace/breakpoint trap",
         [SIGABRT] = "Abnormal termination",
+        [7]       = NULL,
         [SIGFPE]  = "Erroneous arithmetic operation",
         [SIGKILL] = "Killed",
+        [10]      = NULL,
         [SIGSEGV] = "Invalid access to storage",
+        [12]      = NULL,
         [SIGPIPE] = "Broken pipe",
         [SIGALRM] = "Alarm clock",
         [SIGTERM] = "Termination request"
@@ -1394,7 +1461,7 @@ tError initEpoll( void )
                         &epollEvent ) == -1 )
         {
             result = -errno;
-            logError( "unable to register exitloop fd %d with epoll fd %d",
+            logError( "unable to register exitLoop fd %d with epoll fd %d",
                       gEvent.pipe.exitLoop[kReadEnd], gEvent.epoll.fd );
         }
     }

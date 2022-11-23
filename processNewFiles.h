@@ -2,7 +2,12 @@
 // Created by paul on 10/2/22.
 //
 
+#ifndef PROCESSNEWFILES__PROCESSNEWFILES_H_
+#define PROCESSNEWFILES__PROCESSNEWFILES_H_
+
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -21,9 +26,6 @@
 #include <uthash.h>
 #include <utlist.h>
 
-
-#ifndef PROCESSNEWFILES__PROCESSNEWFILES_H_
-#define PROCESSNEWFILES__PROCESSNEWFILES_H_
 
 typedef unsigned long   tHash;
 typedef int             tError;

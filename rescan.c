@@ -61,7 +61,8 @@ tNFTWresult scanFileNode( tWatchedTree *      watchedTree,
                 logError( "the shadow file \'%s/%s\' is not a regular file", watchedTree->shadow.path, relPath );
             }
         }
-//        logDebug( "%d%-*c file: %s (%s)", ftwbuf->level, ftwbuf->level * 4, ':', relPath, status );
+        (void)status;
+//      logDebug( "%d%-*c file: %s (%s)", ftwbuf->level, ftwbuf->level * 4, ':', relPath, status );
     }
 
     return FTW_CONTINUE;
