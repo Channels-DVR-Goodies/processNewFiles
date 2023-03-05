@@ -1,20 +1,19 @@
-//
-// Created by paul on 6/5/22.
-//
+/*
+ *  Created by Paul Chambers on 6/5/22.
+ */
 
 #include "processNewFiles.h"
 
 #include <sys/epoll.h>
-#include <argtable3.h>
 
+#include <argtable3.h>
 #include <libconfig.h>
-#include <stdarg.h>
 
 #include "events.h"
 #include "logStuff.h"
 
 
-/** gEvent */
+/** shared globals */
 tGlobals g;
 
 
@@ -23,7 +22,6 @@ tGlobals g;
  * detach from parent, and become an independent process group leader
  * @return normally does not return, if it does, it's an error.
  */
-
 tError printUsage( void ** argtable )
 {
     fprintf( stdout, "Usage: %s", g.executableName );
@@ -36,40 +34,11 @@ tError printUsage( void ** argtable )
 }
 
 
-
-#if 0
-ssize_t appendString( char ** string, const char * fmt, ... )
-__attribute__ ((format (printf, 2, 3)));
 /**
  * @brief
- * @param string  the string to append to
- * @param fmt     "printf"-style format string
- * @param ...     the values for the fmt string
- * @return new length of string
+ * @param group
+ * @return
  */
-ssize_t appendString( char ** string, const char * fmt, ... )
-{
-    va_list  args;
-    ssize_t  addLength;
-    char *   addString;
-
-    ssize_t len = strlen( *string );
-
-    va_start( args, fmt );
-
-    addLength = vasprintf( &addString, fmt, args );
-
-    va_end( args );
-    if ( addLength != -1 ) {
-        *string = realloc( *string, len + addLength + 1 );
-        strncpy( &(*string)[ len ], addString, addLength );
-        free( addString );
-    }
-
-    return len + addLength;
-}
-#endif
-
 tError importTree( const config_setting_t * group )
 {
     tError result = 0;
@@ -89,12 +58,22 @@ tError importTree( const config_setting_t * group )
             if ( path != NULL ) {
                 logDebug( "path = \"%s\"", path );
                 member = config_setting_get_member( group, "exec" );
-                if ( member != NULL ) {
+                if ( member == NULL ) {
+                    logError("in %s at line %d: watch group doesn't have a \'exec\' element",
+                             config_setting_source_file(group),
+                             config_setting_source_line(group));
+                } else {
                     exec = config_setting_get_string( member );
                     if ( exec != NULL ) {
                         logDebug( "exec = \"%s\"", exec );
                     }
                 }
+            }
+            if ( path == NULL || exec == NULL )
+            {
+                logError( "both 'path' and 'exec' elements must be present in a watch group");
+                result = -EINVAL;
+            } else {
                 result = createTree( path, exec );
             }
         }
@@ -105,6 +84,7 @@ tError importTree( const config_setting_t * group )
     }
     return result;
 }
+
 
 /**
  * @brief
@@ -141,7 +121,9 @@ tError importConfig( const config_t * config )
             break;
 
         default:
-            logError( "'watch' must be either a array or list of arrays" );
+            logError( "in %s at line %d: 'watch' must be either a array or list of arrays",
+                      config_setting_source_file( setting ),
+                      config_setting_source_line( setting ) );
             result = -EINVAL;
             break;
         }
@@ -149,6 +131,7 @@ tError importConfig( const config_t * config )
 
     return result;
 }
+
 
 /**
  * @brief
@@ -200,6 +183,13 @@ int processConfigFile( config_t * config, const char * path )
     return result;
 }
 
+
+/**
+ * @brief
+ * @param config
+ * @param configFileArg
+ * @return
+ */
 tError processConfigFiles( config_t * config, const struct arg_file * configFileArg )
 {
     tError result = 0;
@@ -222,8 +212,8 @@ tError processConfigFiles( config_t * config, const struct arg_file * configFile
         if ( home != NULL ) {
             configFile = NULL;
             if ( asprintf( &configFile,
-                            "%s/.config/%s.conf",
-                            home, g.executableName ) < 1 ) {
+                           "%s/.config/%s.conf",
+                           home, g.executableName ) < 1 ) {
                 logError( "unable to generate path to user's config file" );
             } else {
                 result = processConfigFile( config, configFile );
@@ -288,22 +278,22 @@ tError processArgs( int argc, char * argv[] )
     /* the global arg_xxx structs above are initialised within the argtable */
     void * argtable[] =
     {
-         option.help       =   arg_lit0( "h", "help",
-                                               "display this help (and exit)" ),
-         option.version    =   arg_lit0( "V", "version",
-                                               "display version info (and exit)" ),
-         option.killDaemon =   arg_lit0( "k", "kill",
-                                               "shut down the background daemon (and exit)" ),
-         option.debugLevel =   arg_int0( "d", "debug-level", "",
-                                               "set the level of detail being logged (0-7, 0 is least detailed)" ),
-         option.configFile =  arg_filen( "c", "config-file", "<file>",
-                                               0, 10,
-                                               "get configuration from the file provided" ),
-         option.path       =  arg_filen( NULL, NULL, "<file>",
-                                               0, 5,
-                                               "input files" ),
+         option.help       =  arg_lit0( "h", "help",
+                                            "display this help (and exit)" ),
+         option.version    =  arg_lit0( "V", "version",
+                                            "display version info (and exit)" ),
+         option.killDaemon =  arg_lit0( "k", "kill",
+                                            "shut down the background daemon (and exit)" ),
+         option.debugLevel =  arg_int0( "d", "debug-level", "",
+                                            "set the level of detail being logged (0-7, 0 is least detailed)" ),
+         option.configFile = arg_filen( "c", "config-file", "<file>",
+                                            0, 10,
+                                            "get configuration from the file provided" ),
+         option.path       = arg_filen( NULL, NULL, "<file>",
+                                            0, 5,
+                                            "input files" ),
 
-         option.end        =    arg_end( 20 )
+         option.end        =   arg_end( 20 )
     };
 
 
@@ -319,14 +309,14 @@ tError processArgs( int argc, char * argv[] )
         if ( option.help->count > 0 ) {  /* special case: '--help' takes precedence over everything else */
             return printUsage( argtable );
         } else if ( option.killDaemon->count > 0 ) {  /* ditto for '--kill' */
-            return terminateDaemon( getDaemonPID());
+            return terminateDaemon( getDaemonPID() );
         } else if ( option.version->count > 0 ) {     /* and for '--version' */
             fprintf(  stdout, "%s, version %s\n", g.executableName, "(to do)" );
             return 0;
         }
 
         g.timeout.idle   = 10;
-        g.timeout.rescan = 60;
+        g.timeout.rescan = 30;
 
         config = (config_t *)calloc( 1, sizeof(config_t));
         if ( config != NULL ) {
@@ -336,11 +326,12 @@ tError processArgs( int argc, char * argv[] )
         }
 
         /* release each non-null entry in argtable[] */
-        arg_freetable( argtable, sizeof( argtable ) / sizeof( argtable[ 0 ] ));
+        arg_freetable( argtable, sizeof( argtable ) / sizeof( argtable[ 0 ] ) );
     }
 
     return result;
 }
+
 
 /**
  * @brief

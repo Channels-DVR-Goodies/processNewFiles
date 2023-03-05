@@ -6,6 +6,7 @@
 
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/signalfd.h>
 #include <time.h>
 #include <ftw.h>
 #include <sys/inotify.h>
@@ -13,25 +14,11 @@
 #include "events.h"
 #include "logStuff.h"
 #include "rescan.h"
+#include "inotify.h"
 
 typedef enum {
-    kExitLoop = 1,  /* external trigger to exit the loop */
-    kExecTrigger,   /* execute the next entry in the exec queue */
+    kSignalEvent = 1,  /* signal received */
 } tEpollSpecialValue;
-
-typedef enum {
-    kReadEnd  = 0,
-    kWriteEnd = 1
-} tPipeEnd;
-
-/* to be used in messages of the form 'because it %s' */
-const char * const expiredReasonAsStr[] = {
-    [kUnmonitored] = "is not monitored",
-    [kFirstSeen]   = "is new",
-    [kModified]    = "has been modified",
-    [kMoved]       = "has moved",
-    [kRetry]       = "is being retried"
-};
 
 static struct {
     struct {
@@ -39,400 +26,12 @@ static struct {
     } epoll;
 
     struct {
-        tFileDscr exitLoop[2];
-        tFileDscr execTrigger[2];
-    } pipe;
+        tFileDscr   fd;
+    } signal;
 
     tWatchedTree *  treeList;
 } gEvent;
 
-const char * const fsTypeAsStr[] = {
-    [kUnsetNodeType] = "(unset)",
-    [kDirectory]     = "directory",
-    [kFile]          = "file"
-};
-
-
-/**
- * @brief
- * @param buffer
- * @param bufferSize
- * @param event
- * @return
- */
-const char * inotifyEventTypeAsStr( const struct inotify_event * event )
-{
-
-    static struct {
-        int mask;
-        const char * label;
-    } iNotifyFlags[] = {
-        { IN_ACCESS,       "Access" },        /* File was accessed.  */
-        { IN_MODIFY,       "Modify" },        /* File was modified.  */
-        { IN_ATTRIB,       "Attrib" },        /* Metadata changed.  */
-        { IN_CLOSE_WRITE,  "Close_Write" },   /* File opened for writing was closed.  */
-        { IN_CLOSE_NOWRITE,"Close_NoWrite" }, /* File opened for reading was closed.  */
-        { IN_OPEN,         "Open" },          /* File was opened.  */
-        { IN_MOVED_FROM,   "Moved_From" },    /* File was moved from <src>.  */
-        { IN_MOVED_TO,     "Moved_To" },      /* File was moved to <dest>.  */
-        { IN_CREATE,       "Create" },        /* File was created in dir.  */
-        { IN_DELETE,       "Delete" },        /* File was deleted from dir.  */
-        { IN_DELETE_SELF,  "Delete_Self" },   /* Self was deleted.  */
-        { IN_MOVE_SELF,    "Move_Self" },     /* Self was moved.  */
-        /* Flags set by kernel */
-        { IN_UNMOUNT,      "Unmount" },       /* Backing fs was unmounted.  */
-        { IN_Q_OVERFLOW,   "Q_Overflow" },    /* Event queued overflowed.  */
-        { IN_IGNORED,      "Ignored" },       /* File was ignored.  */
-        { IN_ISDIR,        "IsDir" },         /* Event refers to a directory */
-        /* mark the end of the table */
-        { 0, NULL }
-    };
-
-
-    size_t bufferSize = 1;  /* for the trailing null */
-    for ( int i          = 0; iNotifyFlags[ i ].mask != 0; ++i ) {
-        if ( event->mask & iNotifyFlags[ i ].mask ) {
-            bufferSize += strlen( iNotifyFlags[ i ].label ) + sizeof(" | ");
-        }
-    }
-
-    char * buffer = (char *)calloc( 1, bufferSize );
-
-    if ( buffer == NULL ) return NULL;
-
-    bool needSeparator = false;
-    for ( int i = 0; iNotifyFlags[ i ].mask != 0; ++i ) {
-        if ( event->mask & iNotifyFlags[ i ].mask ) {
-            if ( needSeparator ) {
-                strncat( buffer, " | ", bufferSize );
-            }
-            strncat( buffer, iNotifyFlags[ i ].label, bufferSize );
-            needSeparator = true;
-        }
-    }
-
-    return buffer;
-}
-
-
-/**
- * @brief
- * @param buffer
- * @param remaining
- * @param watchedTree
- * @param fsNode
- */
-const char * fsNodeAsStr( const tFSNode * fsNode )
-{
-    char * result = NULL;
-
-    const char * emptyStr = "";
-    /* Print the name of the watched node */
-    if ( fsNode != NULL )
-    {
-        const char * cookieStr = emptyStr;
-        if ( fsNode->cookie != 0 ) {
-            if ( asprintf( (char **)&cookieStr, " {%u}", fsNode->cookie ) < 1 ) {
-                logError( "unable to generate cookie message");
-            }
-        }
-
-        const char * expiresStr = emptyStr;
-        if ( fsNode->expires != 0 )
-        {
-            if ( asprintf( (char **)&expiresStr,
-                            " expires in %lu secs",
-                            fsNode->expires - time(NULL ) ) < 1 ) {
-                logDebug( "unable to generate timeout message" );
-            }
-        }
-
-        if ( asprintf( &result,
-                        "%s [%02d] \'%s\'%s %s%s",
-                        fsTypeAsStr[ fsNode->type ],
-                        fsNode->watchID,
-                        fsNode->path,
-                        cookieStr,
-                        expiredReasonAsStr[ fsNode->expiredReason ],
-                        expiresStr ) < 1 ) {
-            logDebug( "unable to generate debug message" );
-        }
-
-        if ( cookieStr  != emptyStr ) free( (void *)cookieStr );
-        if ( expiresStr != emptyStr ) free( (void *)expiresStr );
-    }
-
-    return result;
-}
-
-#if 1
-/**
- * @brief
- * @param watchedTree
- * @param fsNode
- */
-void logFsNode( const tFSNode * fsNode )
-{
-    const char * buffer;
-
-    buffer = fsNodeAsStr( fsNode );
-    logDebug( "%s", buffer );
-    free( (void *)buffer );
-}
-#endif
-
-/**
- * @brief
- * @param event
- * @param watchedNode
- * @param pathNode
- */
-void logEvent( const struct inotify_event * event, const tFSNode * watchedNode )
-{
-#ifdef DEBUG
-    /* don't log directory events. it's just extra noise at this point. */
-    if ( event != NULL && !(event->mask & IN_ISDIR) )
-    {
-        /* display event type. */
-        const char * eventTypeStr = inotifyEventTypeAsStr( event );
-
-        char * cookieStr = NULL;
-        if ( asprintf( &cookieStr, " (%u)", event->cookie ) < 1 ) {
-            logDebug( "unable to generate debug message" );
-        }
-        if ( event->cookie == 0 ) {
-            cookieStr[0] = '\0';
-        }
-
-        /* the name of the file, if any. */
-        const char * nameStr = event->name;
-        if ( event->len == 0 ) {
-            nameStr = "";
-        }
-
-        const char * nodeStr = NULL;
-
-        const tWatchedTree * watchedTree = watchedNode->watchedTree;
-        if ( watchedTree != NULL ) {
-            tFSNode * fsNode;
-            HASH_FIND( watchHandle, watchedTree->watchHashMap, &event->wd, sizeof( tWatchID ), fsNode );
-            if ( fsNode == NULL ) {
-                logError( "Error: watchID [%02d] not found", event->wd );
-            } else {
-                nodeStr = fsNodeAsStr( watchedNode );
-            }
-        }
-        logDebug( "[%02u] %-32s %-8s %s (%s)", event->wd, eventTypeStr, cookieStr, nodeStr, nameStr );
-
-        free( (void *)eventTypeStr );
-        free( (void *)nodeStr );
-    }
-#endif
-}
-
-
-/**
- * @brief
- * @param string
- * @return
- */
-tHash calcHash( const char * string )
-{
-    tHash result = 0xDeadBeef;
-
-    const char * p = string;
-    while ( *p != '\0' ) {
-        result = (result * 43) ^ *p++;
-    }
-
-    return result;
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param fullPath
- * @return
- */
-tFSNode * fsNodeFromPath( const tWatchedTree * watchedTree, const char * fullPath )
-{
-    tFSNode * fsNode;
-
-    tHash hash = calcHash( fullPath );
-    HASH_FIND( pathHandle, watchedTree->pathHashMap, &hash, sizeof( tHash ), fsNode );
-    return fsNode;
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param watchID
- * @return
- */
-tFSNode * fsNodeFromWatchID( const tWatchedTree * watchedTree, tWatchID watchID )
-{
-    tFSNode * fsNode;
-
-    HASH_FIND( watchHandle, watchedTree->watchHashMap, &watchID, sizeof( tWatchID ), fsNode );
-    return fsNode;
-}
-
-
-/**
- * @brief figure out when the next soonest expiration will occur
- * @return time_t of the next expiration
- */
-time_t nextExpiration( void )
-{
-    time_t whenExpires = (unsigned)(-1L); // the end of time...
-#ifdef DEBUG
-    const char * whatExpires = NULL;
-    tExpiredReason whyExpires = kUnmonitored;
-#endif
-
-    for ( tWatchedTree * watchedTree = gEvent.treeList; watchedTree != NULL; watchedTree = watchedTree->next )
-    {
-        if ( watchedTree->nextRescan < whenExpires ) {
-            whenExpires = watchedTree->nextRescan;
-#ifdef DEBUG
-            whyExpires  = kUnmonitored;
-            whatExpires = NULL;
-#endif
-        }
-
-#ifdef DEBUG
-        for( tFSNode * node = watchedTree->expiringList; node != NULL; node = node->expiringNext ) {
-            logDebug("%p: %s in %ld secs", node, node->relPath, node->expires - time( NULL ) );
-        }
-#endif
-        /* list is sorted ascending by expiration, so the head of the list is the next to expire */
-        tFSNode const * pathNode = watchedTree->expiringList;
-        if ( pathNode != NULL && pathNode->expires != 0 && whenExpires > pathNode->expires ) {
-            whenExpires = pathNode->expires;
-#ifdef DEBUG
-            whyExpires  = pathNode->expiredReason;
-            whatExpires = pathNode->relPath;
-#endif
-        }
-    }
-
-    time_t now = time( NULL );
-    if ( whenExpires < now ) {
-        whenExpires = now + 1;
-    } else if ( whenExpires - now > 3600 ) {
-        whenExpires = now + 3600;
-    }
-
-#ifdef DEBUG
-    if ( whyExpires == kUnmonitored ) {
-        logDebug( "rescan in %ld seconds", whenExpires - now );
-    } else {
-        logDebug( "%s %s, and will expire in %ld seconds",
-                  whatExpires, expiredReasonAsStr[ whyExpires ], whenExpires - now );
-    }
-#endif
-
-    return whenExpires;
-}
-
-
-/**
- * @brief function to ensure expiringList is in ascending order of expiration
- * @param newNode
- * @param existingNode
- * @return
- */
-int orderedByExpiration( const tFSNode * newNode, const tFSNode * existingNode )
-{
-    if ( newNode->expires < existingNode->expires ) {
-        return -1;
-    }
-    if ( newNode->expires > existingNode->expires ) {
-        return 1;
-    }
-    return 0;
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param fsNode
- * @param reason
- * @param expires
- */
-void resetExpiration( tFSNode * fsNode, tExpiredReason reason )
-{
-    if (fsNode != NULL)
-    {
-        time_t expires = time(NULL ) + fsNode->idlePeriod;
-
-        logDebug( "resetExpiration of %s", fsNode->relPath );
-        fsNode->expiredReason = reason;
-        if ( fsNode->expires != expires ) {
-            tWatchedTree * watchedTree = fsNode->watchedTree;
-            if ( watchedTree->expiringList != NULL ) {
-                LL_DELETE2( watchedTree->expiringList, fsNode, expiringNext );
-            }
-            fsNode->expires = expires;
-            if ( expires > 0 ) {
-                LL_INSERT_INORDER2( watchedTree->expiringList, fsNode, orderedByExpiration, expiringNext );
-            }
-        }
-    }
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param fullPath
- * @param type
- * @return
- */
-tFSNode * watchNode( tWatchedTree * watchedTree, const char * fullPath, tFSNodeType type )
-{
-    errno = 0;
-    /* look up the FSNode using the hash of the full path */
-    tFSNode * fsNode = fsNodeFromPath( watchedTree, fullPath );
-
-    if ( fsNode == NULL ) {
-        fsNode = (tFSNode *)calloc( 1, sizeof( tFSNode ) );
-        fsNode->watchedTree = watchedTree;
-        fsNode->type        = type;
-        fsNode->path        = strdup( fullPath );
-        fsNode->pathHash    = calcHash( fsNode->path );
-        fsNode->relPath     = &fsNode->path[ watchedTree->root.pathLen ];
-        fsNode->idlePeriod  = g.timeout.idle;
-
-        HASH_ADD( pathHandle, watchedTree->pathHashMap, pathHash, sizeof( tHash ), fsNode );
-
-        switch (type)
-        {
-        case kFile:
-            resetExpiration( fsNode, kFirstSeen );
-            break;
-
-        case kDirectory:
-            fsNode->watchID = inotify_add_watch( watchedTree->inotify.fd, fullPath, IN_ALL_EVENTS);
-            if ( fsNode->watchID == -1 ) {
-                logError( "problem watching directory \'%s\'", fullPath );
-            } else {
-                HASH_ADD( watchHandle, watchedTree->watchHashMap, watchID, sizeof( tWatchID ), fsNode );
-            }
-            break;
-
-        default:
-            break;
-        }
-
-        logFsNode( fsNode );
-    }
-
-    return fsNode;
-}
 
 #if 0
 /**
@@ -450,449 +49,90 @@ void freeNode( tFSNode * fsNode )
 }
 #endif
 
+/* to be used in messages of the form 'because it %s' */
+const char * const expiredReasonAsStr[] = {
+        [kUnmonitored] = "is not monitored",
+        [kFirstSeen]   = "is new",
+        [kModified]    = "has been modified",
+        [kMoved]       = "has moved",
+        [kRetry]       = "is being retried"
+};
+
 /**
- * @brief destroy a fsNode and remove any references to it
- * Typically this is a fileNode that expired, so it's no
- * longer of interest.
- * @see removeNode()
- * @param fsNode
+ *
+ * @param signum
  */
-void forgetNode( tFSNode * fsNode )
+void logSignal( unsigned int signum )
 {
-    if (fsNode == NULL) return;
+    const char * signalInfo[][2] = {
+            [SIGHUP]    = { "SIGHUP",    "Hangup" },
+            [SIGINT]    = { "SIGINT",    "Interactive attention signal" },
+            [SIGQUIT]   = { "SIGQUIT",   "Quit" },
+            [SIGILL]    = { "SIGILL",    "Illegal instruction" },
+            [SIGTRAP]   = { "SIGTRAP",   "Trace/breakpoint trap" },
+            [SIGABRT]   = { "SIGABRT",   "Abnormal termination" },
+            [SIGFPE]    = { "SIGFPE",    "Erroneous arithmetic operation" },
+            [SIGKILL]   = { "SIGKILL",   "Killed" },
+            [SIGSEGV]   = { "SIGSEGV",   "Invalid access to storage" },
+            [SIGPIPE]   = { "SIGPIPE",   "Broken pipe" },
+            [SIGALRM]   = { "SIGALRM",   "Alarm clock" },
+            [SIGTERM]   = { "SIGTERM",   "Termination request" },
+            [SIGSTKFLT] = { "SIGSTKFLT", "Stack fault" },
+            [SIGCHLD]   = { "SIGCHLD",   "Child exited" },
+            [SIGCONT]   = { "SIGCONT",   "Continued" },
+            [SIGSTOP]   = { "SIGSTOP",   "Stopped (signal)" },
+            [SIGTSTP]   = { "SIGTSTP",   "Stopped" },
+            [SIGTTIN]   = { "SIGTTIN",   "Stopped (tty input)" },
+            [SIGTTOU]   = { "SIGTTOU",   "Stopped (tty output)" },
+            [SIGURG]    = { "SIGURG",    "Urgent I/O condition" },
+            [SIGXCPU]   = { "SIGXCPU",   "CPU time limit exceeded" },
+            [SIGXFSZ]   = { "SIGXFSZ",   "File size limit exceeded" },
+            [SIGVTALRM] = { "SIGVTALRM", "Virtual timer expired" },
+            [SIGPROF]   = { "SIGPROF",   "Profiling timer expired" },
+            [SIGWINCH]  = { "SIGWINCH",  "Window changed" },
+            [SIGPOLL]   = { "SIGPOLL",   "I/O possible" },
+            [SIGPWR]    = { "SIGPWR",    "Power failure" },
+            [SIGSYS]    = { "SIGSYS",    "Bad system call" },
+    };
 
-    tWatchedTree * watchedTree = fsNode->watchedTree;
-
-    if (watchedTree != NULL) {
-        if ( fsNode->watchID != 0 ) {
-            inotify_rm_watch( watchedTree->inotify.fd, fsNode->watchID );
+    const char * sigName = "(unknown)";
+    const char * sigDesc = "(unknown)";
+    if ( signum <= SIGSYS) {
+        if ( signalInfo[signum][0] != NULL ) {
+            sigName = signalInfo[signum][0];
         }
-        if ( watchedTree->expiringList != NULL) {
-            LL_DELETE2( watchedTree->expiringList, fsNode, expiringNext );
-        }
-        if ( watchedTree->pathHashMap != NULL) {
-            HASH_DELETE( pathHandle, watchedTree->pathHashMap, fsNode );
+        if ( signalInfo[signum][1] != NULL ) {
+            sigDesc = signalInfo[signum][1];
         }
     }
-}
 
-
-/**
- * @brief node is disappearing, so remove it from our structures, too.
- * Removes any file that may have been created in the shadow hierarchy, too.
- * @see forgetNode()
- * @param fsNode
- */
-void removeNode( tFSNode * fsNode )
-{
-    if ( fsNode == NULL ) {
-        return;
-    }
-
-    logDebug( "remove \'%s\' [%02d]", fsNode->path, fsNode->watchID  );
-
-    const tWatchedTree * const watchedTree = fsNode->watchedTree;
-    if ( fsNode->type == kFile ) {
-        /* if a file is created and then deleted before it's ever processed, then
-         * it won't be present in the shadow hierarchy yet - and that's normal */
-        if ( unlinkat( watchedTree->shadow.fd, fsNode->relPath, 0 ) == -1 && errno != ENOENT ) {
-            logError( "failed to delete \'%s\'", fsNode->path );
-        }
-        errno = 0;
-    }
-
-    forgetNode( fsNode );
-}
-
-/**
- * @brief
- * @param fileNode
- * @return
- */
-tError retryFileNode( tFSNode * fileNode )
-{
-    tError result = 1;
-
-    fileNode->retries++;        /* count the failures, so we don't retry forever */
-    fileNode->idlePeriod *= 2;  /* double the idle delay each time it fails */
-    /* spread the expirations out over time, to spread the load if many of them
-     * fail quickly and would otherwise be retried at almost the same time. This
-     * is most likely to happen if the 'exec' statement provided by the user is
-     * faulty in some way, e.g. doesn't have sufficient permissions */
-    // fileNode->idlePeriod += (random() % g.timeout.idle);
-
-    if ( fileNode->retries >= 5 ) {
-        logError( "failed to process \'%s\' successfully after %d retries",
-                  fileNode->path,
-                  fileNode->retries );
-        result = -ENOTRECOVERABLE;
-    } else {
-        logError( "attempt %d to process \'%s\' failed, retry in %ld secs",
-                  fileNode->retries,
-                  fileNode->relPath,
-                  fileNode->idlePeriod );
-        /* put it back onto the expireList to try again */
-        resetExpiration( fileNode, kRetry );
-    }
-    return result;
-}
-
-/**
- * @brief
- * @param fileNode
- */
-void markFileComplete( tFSNode * fileNode )
-{
-    const tWatchedTree * watchedTree = fileNode->watchedTree;
-
-    int fd = openat( watchedTree->shadow.fd,
-                 fileNode->relPath,
-                     O_RDONLY | O_CREAT | O_TRUNC,
-                     S_IRUSR | S_IRGRP );
-    /* openat does not apply the permissions if the
-     * file isn't new, so also do it explicitly */
-    fchmod( fd, S_IRUSR | S_IRGRP );
-    close( fd );
-
-    forgetNode( fileNode );
-    /* ToDo: free the fileNode */
-}
-
-/**
- * @brief execute the processing for the provided fileNode
- * if it fails, it will be added to the expiring list with a new
- * expiration time. Otherwise, it'll keep getting retried immediately,
- * and everything else will back up behind it
- * @param fileNode
- * @return
- */
-tError execFileNode( tFSNode * fileNode )
-{
-    tError   result = 0;
-
-    logDebug( "### execute %s", fileNode->path );
-
-    /* ToDo: Actually execute it */
-    result = ( fileNode->retries < 3 )? -1 : 0 ;
-
-    if (result == 0) {
-        /* processing completed without error, so adjust the shadow file accordingly */
-        markFileComplete( fileNode );
-    } else {
-        result = retryFileNode( fileNode );
-    }
-    return result;
+    logInfo( "daemon received signal %d: %s (%s)", signum, sigDesc, sigName );
 }
 
 
 /**
  * @brief
- * @param fileNode
+ * @param siginfo
  * @return
  */
-tError fileExpired( tFSNode * fileNode )
-{
-    tError   result = 0;
-    const tWatchedTree * watchedTree = fileNode->watchedTree;
-
-    logDebug( "\'%s\' %s, and has expired", fileNode->path, expiredReasonAsStr[ fileNode->expiredReason ] );
-
-    /* remove any existing shadow file */
-    if ( unlinkat( watchedTree->shadow.fd, fileNode->relPath, 0 ) == -1 && errno != ENOENT ) {
-        logError( "unable to remove shadow file \'%s\'", fileNode->relPath );
-    }
-    /* create a fresh shadow file */
-    int fd = openat( watchedTree->shadow.fd, fileNode->relPath, O_WRONLY | O_CREAT | O_TRUNC, S_IRWXU );
-    if ( fd == -1 ) {
-        result = -errno;
-        logError( "unable to create shadow file \'%s%s\'", watchedTree->shadow.path, fileNode->relPath );
-    } else {
-        char * buffer;
-
-        if ( asprintf( &buffer, "#!/bin/bash\nFILE=\'%s\'\nREASON=\'%s\'\n%s\n",
-                        fileNode->path,
-                        expiredReasonAsStr[ fileNode->expiredReason ],
-                        watchedTree->exec ) < 1 ) {
-            logDebug( "unable to generate script contents" );
-        }
-        int len = strlen( buffer );
-        if ( write( fd, buffer, len) < len ) {
-            logError( "unable to write script contents" );
-        }
-        free( buffer );
-        close( fd );
-
-        result = 0; execFileNode( fileNode );
-    }
-
-    return result;
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param watchID
- */
-void removeWatchID( tWatchedTree * watchedTree, tWatchID watchID )
-{
-    /* the inotify ID has already been removed, and we won't be
-     * seeing it again. so clean up our parallel structures */
-    tFSNode * fsNode;
-
-    HASH_FIND( watchHandle, watchedTree->watchHashMap, &watchID, sizeof( tWatchID ), fsNode );
-    if ( fsNode != NULL ) {
-        logDebug( "ignore [%d]", watchID );
-        removeNode( fsNode );
-    }
-}
-
-
-/**
- * @brief scan the expiringList of each watchedTree, expiring entries whose time has passed
- * @return
- */
-tError processExpiredFSNodes( void )
+int processOneSignalEvent( struct signalfd_siginfo * siginfo )
 {
     int result = 0;
 
-    time_t now = time( NULL );
-    for ( tWatchedTree * watchedTree = gEvent.treeList;
-          watchedTree != NULL;
-          watchedTree = watchedTree->next )
+    logSignal( siginfo->ssi_signo );
+    switch ( siginfo->ssi_signo )
     {
-        tFSNode * fsNode;
-        while ( (fsNode = watchedTree->expiringList) != NULL
-                 && fsNode->expires <= now)
-        {
-            /* remove the first item on the expiringList... */
-            watchedTree->expiringList = fsNode->expiringNext;
+    case SIGINT:
+        result = -EINTR;
+        break;
 
-            /* ..because it expired */
-            result = fileExpired( fsNode );
+    case SIGCHLD:
+        logInfo( "Child exit status %d", siginfo->ssi_status );
+        break;
 
-            /* if there was a problem, exit the loop */
-            if (result != 0) break;
-        }
+    default:
+        break;
     }
-    return result;
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param fullPath
- * @param pathNode
- */
-void doiNotifyDelete( tFSNode * pathNode )
-{
-    if ( pathNode->type == kFile ) {
-        const tWatchedTree * const watchedTree = pathNode->watchedTree;
-        if ( unlinkat( watchedTree->shadow.fd, pathNode->relPath, 0 ) == -1 ) {
-            logError( "Error: unable to delete the shadow file \'%s%s\'",
-                      watchedTree->shadow.path, pathNode->relPath );
-        }
-    }
-    removeNode( pathNode );
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param event
- * @param fullPath
- * @param expires
- * @param pathNode
- */
-void doiNotifyCreate( tFSNode * pathNode,
-                      const struct inotify_event * event,
-                      const char * fullPath )
-{
-    (void) event; (void) fullPath;
-    if ( pathNode->type == kFile ) {
-        /* start the idle timer */
-        resetExpiration( pathNode, kFirstSeen );
-    }
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param expires
- * @param pathNode
- */
-void doiNotifyCloseWrite( tFSNode * pathNode )
-{
-    tExpiredReason reason = pathNode->expiredReason;
-    if ( reason != kFirstSeen ) {
-        reason = kModified;
-    }
-    resetExpiration( pathNode, reason );
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param event
- * @param fullPath
- * @param hash
- * @param expires
- * @param pathNode
- */
-void doiNotifyMove( tFSNode * pathNode,
-                    const struct inotify_event * event,
-                    const char * fullPath )
-{
-    tWatchedTree * watchedTree = pathNode->watchedTree;
-
-    /* The IN_MOVED_FROM and IN_MOVED_TO are issued in pairs,
-     * tied together with the same (non-zero) cookie value  */
-    if ( event->cookie != 0 ) {
-        tFSNode * cookieNode;
-        HASH_FIND( cookieHandle, watchedTree->cookieHashMap, &event->cookie, sizeof( tCookie ), cookieNode );
-        if ( cookieNode == NULL ) {
-            cookieNode = pathNode;
-            cookieNode->cookie = event->cookie;
-            HASH_ADD( cookieHandle, watchedTree->cookieHashMap, cookie, sizeof( tCookie ), cookieNode );
-        }
-
-        // occurs first of the pair - figure out the existing pathNode
-        if ( event->mask & IN_MOVED_FROM ) {
-            logDebug( "{%u} move [%02d] from \'%s\' #%lu",
-                      cookieNode->cookie, cookieNode->watchID, cookieNode->path, cookieNode->pathHash );
-        }
-
-        // occurs second of the pair - update the root.path in the cookieNode identified in the IN_MOVED_FROM
-        if ( event->mask & IN_MOVED_TO && cookieNode != NULL ) {
-            HASH_DELETE( pathHandle, watchedTree->pathHashMap, cookieNode );
-            free((void *)cookieNode->path );
-            cookieNode->path     = strdup( fullPath );
-            cookieNode->pathHash = calcHash( cookieNode->path );
-            HASH_ADD( pathHandle, watchedTree->pathHashMap, pathHash, sizeof( tHash ), cookieNode );
-
-            HASH_DELETE( cookieHandle, watchedTree->cookieHashMap, cookieNode );
-            cookieNode->cookie = 0;
-
-            resetExpiration( cookieNode, kMoved );
-
-            logDebug( "{%u} move [%02d] to \'%s\'",
-                      cookieNode->cookie, cookieNode->watchID, cookieNode->path );
-        }
-    }
-}
-
-
-/**
- * @brief
- * @param pathNode
- * @param event
- * @param fullPath
- */
-void doiNotifyEvent( tFSNode * pathNode,
-                     const struct inotify_event * event,
-                     const char * fullPath )
-{
-    if ( pathNode == NULL ) {
-        return;
-    }
-
-    tWatchedTree * watchedTree = pathNode->watchedTree;
-    if ( event->mask & IN_Q_OVERFLOW ) {
-        /* dropped some events - rescan ASAP */
-        watchedTree->nextRescan = time(NULL );
-    }
-    if ( event->mask & IN_IGNORED ) {
-        /* for whatever reason, the watchID for this node will be invalid
-         * after this event, so clean up any references we have to it */
-        removeWatchID( watchedTree, event->wd );
-    }
-
-    if ( event->mask & IN_CREATE ) {
-        doiNotifyCreate( pathNode, event, fullPath );
-    } else if ( event->mask & IN_CLOSE_WRITE ) {
-        doiNotifyCloseWrite( pathNode );
-    } else if ( event->mask & ( IN_MOVED_FROM | IN_MOVED_TO ) ) {
-        doiNotifyMove( pathNode, event, fullPath );
-    } else if ( event->mask & IN_DELETE ) {
-        doiNotifyDelete( pathNode );
-    } else { /* all other events */
-        if ( pathNode->expires != 0 ) {
-            resetExpiration( pathNode, pathNode->expiredReason );
-            logDebug( "event has deferred expiration of \'%s\'",
-                      pathNode->path );
-        }
-    }
-}
-
-
-/**
- * @brief
- * @param watchedTree
- * @param event
- * @return
- */
-tError processOneInotifyEvent( tWatchedTree * watchedTree, const struct inotify_event *event )
-{
-    tError result = 0;
-
-    const tFSNode * watchedNode = fsNodeFromWatchID( watchedTree, event->wd );
-    if ( watchedNode == NULL ) {
-        logError( "internal: couldn't find a FSNode with the watchID %d", event->wd );
-        return -ENOENT;
-    }
-
-    /*
-     * Caution: if event->len is zero, the string at event->name is completely
-     * absent - i.e. it's not equivalent to 'strlen(event->name)', it's the
-     * number of bytes that event->name occupies.
-     *
-     * Zero means event->name has a size of zero bytes, NOT that it is an empty
-     * string - there is no NULL terminator *at all*. In other words, if
-     * event->len is zero, don't use event->name, there's NO C string there.
-     */
-    char * fullPath;
-    if ( event->len > 0 ) {
-        if ( asprintf( &fullPath, "%s/%s", watchedNode->path, event->name ) < 1 ) {
-            logDebug( "unable to generate full path" );
-        }
-    } else {
-        fullPath = strdup( watchedNode->path );
-    }
-
-    tFSNode * pathNode = fsNodeFromPath( watchedTree, fullPath );
-    if ( pathNode == NULL && !(event->mask & IN_ISDIR)) {
-        /*
-         * It's a file, and we didn't find its hash of the full path in this
-         * watchedTree. Therefore, this must be the first iNotify activity
-         * we've seen on this file (recently, at least).
-         *
-         * So create a fileNode to track iNotify activity. Each fileNode has an
-         * expiration, which is restarted when an iNotify event is received for
-         * this file. So the timer only expires after the fileNode hasn't
-         * received any iNotify events for long enough (i.e. the 'idle'
-         * timeout).
-         *
-         * If/when that happens, the fileNode will be 'expired' by calling
-         * fileExpired(), which cleans up and queues the file to be processed.
-         */
-        struct stat fileInfo;
-        if ( stat( fullPath, &fileInfo ) == -1 && errno != ENOENT ) {
-            logError( "unable to get information about \'%s\'", fullPath );
-        } else {
-            /* it exists, so make a new fileNode to track iNotify events for it */
-            pathNode = watchNode( watchedTree, fullPath, kFile );
-        }
-    }
-
-    logEvent( event, watchedNode );
-
-    doiNotifyEvent( pathNode, event, fullPath );
-
-    free( (void *)fullPath );
 
     return result;
 }
@@ -900,44 +140,32 @@ tError processOneInotifyEvent( tWatchedTree * watchedTree, const struct inotify_
 
 /**
  * @brief
- * @param watchedTree
- * @param event
  * @return
  */
-tError processInotifyEvents( tWatchedTree * watchedTree )
+int processSignalEvents( void )
 {
     int result = 0;
 
-    /* Some CPU architectures will fault if you attempt tp read multibyte
-     * variables if they are not properly aligned. So for safety's sake, we ask
-     * the compiler to align the buffer with 'int', which is the type of the
-     * first element of struct inotify_event. The compiler will take care of
-     * padding the remaining fields in the rest of the structure so any
-     * alignment requirements for that CPU architecture will be honored.
-     *
-     * A compiler may automagically handle aligning the buffer too, but better
-     * safe than sorry. */
+    static char buf[ 8 * sizeof(struct signalfd_siginfo) ];
 
-    static char buf[8192] __attribute__ ((aligned(__alignof__(int))));
-
-    ssize_t len = read( watchedTree->inotify.fd, buf, sizeof( buf ));
+    ssize_t len = read( gEvent.signal.fd, buf, sizeof( buf ));
 
     /* If the nonblocking read() found nothing to read, then it returns
      * -1 with errno set to EAGAIN. That's a normal case, not an error */
     if ( len == -1 && errno != EAGAIN ) {
-        logError( "unable to read from iNotify fd %d", watchedTree->inotify.fd );
         result = -errno;
+        logError( "unable to read from signal fd %d", gEvent.signal.fd );
     } else {
-        /* Loop over all iNotify events packed into the buffer we just filled */
+        /* Loop over all siginfo events packed into the buffer we just filled */
         int count = 0;
         const char * event = buf;
-        const char * end = buf + len;
+        const char * end   = buf + len;
         while ( event < end ) {
             ++count;
-            result = processOneInotifyEvent( watchedTree, (const struct inotify_event *)event );
-            event += sizeof( struct inotify_event ) + ((struct inotify_event *)event)->len;
+            result = processOneSignalEvent( (struct signalfd_siginfo *)event );
+            event += sizeof( struct signalfd_siginfo );
         }
-        logDebug( "%d iNotify events in a buffer %ld bytes long", count, len );
+        logDebug( "processed %d signal events from a buffer %ld bytes long", count, len );
     }
 
     return result;
@@ -953,26 +181,21 @@ int processEpollEvent( const struct epoll_event * const epollEvent )
 {
     int result = 0;
 
-    logDebug( "epoll event 0x%x, %p", epollEvent->events, epollEvent->data.ptr );
-    /* Loop over the epoll events we just read from the epoll file descriptor. */
+    // logDebug( "epoll bitmask 0x%x, data %p", epollEvent->events, epollEvent->data.ptr );
+    /* Process an epoll event we just read from the epoll file descriptor. */
     if ( epollEvent->events & EPOLLIN )
     {
         /* check for the 'special values' */
         switch ( epollEvent->data.u64 )
         {
-        case kExecTrigger:
-            logDebug( "### exec triggered ###");
-            break;
-
-        case kExitLoop:
-            logDebug( "### exit the loop ###");
-            result = -ECANCELED;
+        case kSignalEvent:
+            result = processSignalEvents();
             break;
 
         default:
             /* if it's not a 'special' event, then iNotify events are waiting,
              * and data.ptr points at the corresponding watchedTree */
-            processInotifyEvents((tWatchedTree *)epollEvent->data.ptr );
+            result = processInotifyEvents(  (tWatchedTree *)epollEvent->data.ptr );
             break;
         }
     }
@@ -983,23 +206,335 @@ int processEpollEvent( const struct epoll_event * const epollEvent )
 
 /**
  * @brief
+ */
+void removePIDfile( void )
+{
+    if ( g.pidFilename != NULL ) {
+        unlink( g.pidFilename );
+        free(g.pidFilename );
+        g.pidFilename = NULL;
+    }
+}
+
+
+/**
+ * @brief execute the processing for the provided fileNode
+ * if it fails, it will be added to the expiring list with a new
+ * expiration time. Otherwise, it'll keep getting retried immediately,
+ * and everything else will back up behind it
+ * @param fileNode
  * @return
  */
-tError checkRescans( void )
+tError readyToExec(tFSNode * fileNode )
+{
+    tError   result = 0;
+
+    logDebug( "### ready to execute %s", fileNode->path );
+
+    fileNode->next = g.readyList;
+    g.readyList = fileNode;
+    ++g.readyCount;
+
+    return result;
+}
+
+
+/**
+ * @brief
+ * @param node
+ * @return
+ */
+tError fileExpired( tFSNode * node )
+{
+    tError   result = 0;
+    const tWatchedTree * watchedTree = node->watchedTree;
+
+    logDebug("\'%s\' has node, and %s", node->relPath, expiredReasonAsStr[ node->expires.because ] );
+
+    /* remove any existing shadow file */
+    if (unlinkat(watchedTree->shadow.fd, node->relPath, 0 ) == -1 && errno != ENOENT ) {
+        logError("unable to remove shadow file \'%s\'", node->relPath );
+    }
+    /* create a fresh shadow file */
+    int fd = openat(watchedTree->shadow.fd, node->relPath, O_WRONLY | O_CREAT | O_TRUNC, S_IRWXU );
+    if ( fd == -1 ) {
+        result = -errno;
+        logError("unable to create shadow file \'%s/%s\'", watchedTree->shadow.path, node->relPath );
+    } else {
+        char * buffer;
+
+        if ( asprintf(&buffer, "#!/bin/bash\nFILE=\'%s\'\nREASON=\'%s\'\n%s\n",
+                      node->path,
+                      expiredReasonAsStr[ node->expires.because ],
+                      watchedTree->exec ) < 1 ) {
+            logDebug( "unable to generate script contents" );
+        }
+        ssize_t len = strlen( buffer );
+        if ( write( fd, buffer, len) < len ) {
+            logError( "unable to write script contents" );
+        }
+        free( buffer );
+        close( fd );
+
+        result = readyToExec(node);
+    }
+
+    return result;
+}
+
+
+/**
+ * @brief scan the expiringList of each watchedTree, expiring entries whose time has passed
+ * @return
+ */
+tError processExpiredFSNodes( void )
+{
+    int result = 0;
+    tFSNode * node;
+
+#ifdef DEBUG
+    int count = 0;
+    for( node = g.expiringList; node != NULL; node = node->next )
+    {
+        ++count;
+        logDebug("%s expires in %ld secs", node->path, node->expires.at - time(NULL) );
+    }
+     if (count > 0) {
+        logDebug( "%d %s waiting to expire", count, count > 1 ? "nodes" : "node" );
+    }
+#endif
+
+    time_t now = time( NULL );
+    while ((node = g.expiringList) != NULL
+           && node->expires.at <= now)
+    {
+        /* remove the first item on the expiringList because it expired... */
+        g.expiringList = node->next;
+
+        switch (node->type)
+        {
+        case kFile:
+            result = fileExpired( node );
+            break;
+
+        case kTree:
+            resetExpiration( node, kRescan );
+            result = rescanTree( node->watchedTree );
+            break;
+
+        default:
+            logError( "(Internal) something expired that isn't supposed to expire!" );
+            break;
+        }
+
+        /* if there was a problem, exit the loop */
+        if (result != 0) break;
+    }
+
+    return result;
+}
+
+
+/**
+ * @brief destroy a fsNode and remove any references to it
+ * Typically this is a fileNode that expired, so it's no
+ * longer of interest.
+ * @see removeNode()
+ * @param fsNode
+ */
+void forgetNode( tFSNode * fsNode )
+{
+    if (fsNode == NULL) return;
+
+    if ( g.expiringList != NULL) {
+        LL_DELETE2(g.expiringList, fsNode, next );
+    }
+
+    tWatchedTree * watchedTree = fsNode->watchedTree;
+
+    if (watchedTree != NULL) {
+        forgetWatch(fsNode);
+        if ( watchedTree->pathHashMap != NULL) {
+            HASH_DELETE( pathHandle, watchedTree->pathHashMap, fsNode );
+        }
+    }
+}
+
+
+/**
+ * @brief
+ * @param fileNode
+ */
+void markFileComplete( tFSNode * fileNode )
+{
+    const tWatchedTree * watchedTree = fileNode->watchedTree;
+
+    int fd = openat( watchedTree->shadow.fd,
+                     fileNode->relPath,
+                     O_RDONLY | O_CREAT | O_TRUNC,
+                     S_IRUSR | S_IRGRP );
+    /* openat does not apply the permissions if the
+     * file isn't new, so also do it explicitly */
+    fchmod( fd, S_IRUSR | S_IRGRP );
+    close( fd );
+
+    forgetNode( fileNode );
+    /* ToDo: free the fileNode */
+}
+
+
+/**
+ * @brief
+ * @param fileNode
+ * @return
+ */
+tError retryFileNode( tFSNode * fileNode )
+{
+    tError result = 1;
+
+    fileNode->expires.retries++;    /* count the failures, so we don't retry forever */
+    fileNode->expires.wait += 2;    /* increase the idle delay each time it fails */
+    /* spread the expirations out over time, to spread the load if many of them
+     * fail quickly and would otherwise be retried at almost the same time. This
+     * is most likely to happen if the 'exec' statement provided by the user is
+     * faulty in some way, e.g. doesn't have sufficient permissions */
+    // fileNode->idlePeriod += (random() % g.timeout.idle);
+
+    if ( fileNode->expires.retries >= 5 ) {
+        logError( "failed to process \'%s\' successfully after %d retries",
+                  fileNode->path,
+                  fileNode->expires.retries );
+        result = -ENOTRECOVERABLE;
+    } else {
+        logError( "attempt %d to process \'%s\' failed, retry",
+                  fileNode->expires.retries,
+                  fileNode->relPath );
+        /* put it back onto the expireList to try again */
+        resetExpiration( fileNode, kRetry );
+    }
+    return result;
+}
+
+
+/**
+ *
+ * @param fileNode
+ * @return
+ */
+tError executeNode( tFSNode * fileNode )
 {
     tError result = 0;
 
-    for ( tWatchedTree * watchedTree = gEvent.treeList;
-          watchedTree != NULL;
-          watchedTree = watchedTree->next ) {
-        /* re-scan each watchedTree hierarchy periodically, since iNotify isn't 100% reliable */
-        if ( time(NULL ) >= watchedTree->nextRescan ) {
-            result = rescanTree( watchedTree );
-            logDebug( "next periodic in %ld secs",
-                      watchedTree->nextRescan - time( NULL ));
-        }
+    /* ToDo: Actually execute it */
+    result = ( fileNode->expires.retries < 2 )? -1 : 0 ;
+
+    if (result == 0) {
+        /* processing completed without error, so adjust the shadow file accordingly */
+        markFileComplete( fileNode );
+    } else {
+        result = retryFileNode( fileNode );
     }
 
+    return result;
+}
+
+
+/**
+ * @brief figure out when the next soonest expiration will occur
+ * @return time_t of the next expiration
+ */
+time_t nextExpiration( void )
+{
+    time_t whenExpires = (unsigned)(-1L); // the end of time...
+#ifdef DEBUG
+    const char * whatExpires  = NULL;
+    tExpiredReason whyExpires = kUnmonitored;
+#endif
+
+    /* list is sorted ascending by expiration, so the head of the list is the next to expire */
+    tFSNode const * node = g.expiringList;
+    if (node != NULL && node->expires.at != 0 && whenExpires > node->expires.at ) {
+        whenExpires = node->expires.at;
+#ifdef DEBUG
+        whyExpires  = node->expires.because;
+        whatExpires = node->path;
+#endif
+    }
+    time_t now = time( NULL );
+    if ( whenExpires < now ) {
+        whenExpires = now + 1;
+    } else if ( whenExpires - now > g.timeout.rescan ) {
+        whenExpires = now + g.timeout.rescan;
+    }
+
+    logDebug( "%s %s, and will expire in %ld seconds",
+              whatExpires, expiredReasonAsStr[ whyExpires ], whenExpires - now );
+
+    return whenExpires;
+}
+
+
+/**
+ * @brief main event loop
+ * @return
+ */
+tError eventLoop( void )
+{
+    int                result = 0;
+    struct epoll_event epollEvents[32];
+
+    rescanAllTrees();
+
+    do {
+        int timeout = (int)(nextExpiration() - time( NULL ));
+
+        /* * * * * * block waiting for events or a timeout * * * * * */
+        logSetErrno( 0 );
+#if 0
+        logDebug( "epoll_wait( fd: %d, %p[%ld], %d secs )",
+                  gEvent.epoll.fd,
+                  epollEvents,
+                  sizeof( epollEvents ) / sizeof( struct epoll_event ),
+                  timeout );
+#endif
+        /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+        int count = epoll_wait( gEvent.epoll.fd,
+                                epollEvents,
+                                sizeof( epollEvents ) / sizeof( struct epoll_event ),
+                                timeout * 1000 );
+        /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+        if ( count < 0 ) {
+            /* something unexpected happened */
+            switch ( errno ) {
+            case EINTR:
+            case EAGAIN:
+                /* harmless */
+                break;
+
+            default:
+                logError( "epoll() returned %d", count );
+                result = -1;
+                break;
+            }
+        } else {
+            /* epoll() delivered inotify events, signal events and/or an expiration */
+            logDebug( "epoll reported %d %s", count, count == 1 ? "event" : "events" );
+
+            /* If any nodes expired and became ready, put them on the ready list,
+             * waiting for a SIGCHLD event to arrive */
+            if ( result == 0 ) {
+                result = processExpiredFSNodes();
+            }
+
+            /* Process any inotify and/or signal events that epoll returned */
+            for ( int i = 0; i < count && result == 0; ++i ) {
+                result = processEpollEvent( &epollEvents[ i ] );
+            }
+        }
+    } while ( result == 0 );
+
+    logInfo( "loop terminated %d", result );
+    removePIDfile();
     return result;
 }
 
@@ -1013,7 +548,7 @@ tError makeShadowDir( tWatchedTree * watchedTree )
 {
     tError result = 0;
 
-    if ( asprintf( (char **)&(watchedTree->shadow.path), "%s.seen/", watchedTree->root.path ) < 1 ) {
+    if ( asprintf( (char **)&(watchedTree->shadow.path), "%s/.seen", watchedTree->root.path ) < 1 ) {
         logError( "failed to generate path to shadow directory" );
     }
     if (watchedTree->shadow.path != NULL ) {
@@ -1045,7 +580,6 @@ tError openRootDir( tWatchedTree * watchedTree, const char * dir )
     tError result = 0;
 
     char * rootPath = realpath( dir, NULL);
-    // watchedTree->root.path =
     if ( rootPath == NULL ) {
         logError( "unable to normalize the root path \'%s\'", dir );
         result = -errno;
@@ -1055,12 +589,8 @@ tError openRootDir( tWatchedTree * watchedTree, const char * dir )
             result = -errno;
             logError( "couldn't get info about %s", watchedTree->root.path );
         } else if ( S_ISDIR( fileInfo.st_mode ) ) {
-            size_t len = strlen( rootPath );
-            rootPath = (char *)realloc( rootPath, len + 2 );
-            rootPath[len++] = '/';
-            rootPath[len]   = '\0';
             watchedTree->root.path    = rootPath;
-            watchedTree->root.pathLen = len;
+            watchedTree->root.pathLen = strlen( rootPath );
 
             logDebug( "absolute root.path is \'%s\'", watchedTree->root.path );
 
@@ -1124,38 +654,6 @@ tError child( int pipeReadFd )
 
 /**
  * @brief
- * @param watchedTree
- * @return
- */
-tError registerForInotifyEvents( tWatchedTree * watchedTree )
-{
-    tError result = 0;
-
-    watchedTree->inotify.fd = inotify_init();
-    if ( watchedTree->inotify.fd == -1 ) {
-        logError( "Unable to register for filesystem events" );
-        result = -errno;
-    } else {
-        struct epoll_event epollEvent;
-        epollEvent.events   = EPOLLIN;
-        epollEvent.data.ptr = watchedTree;
-
-        if ( epoll_ctl( gEvent.epoll.fd,
-                        EPOLL_CTL_ADD,
-                        watchedTree->inotify.fd,
-                        &epollEvent ) == -1 ) {
-            logError( "unable to register inotify.fd fd %d with epoll fd %d",
-                      watchedTree->inotify.fd, gEvent.epoll.fd );
-            result = -errno;
-        }
-    }
-
-    return result;
-}
-
-
-/**
- * @brief
  * @param dir
  * @return
  */
@@ -1172,6 +670,12 @@ tError createTree( const char * dir, const char * exec )
         logDebug( "creating tree for \'%s\'", dir );
 
         /* since calloc() was used for this structure, the pointers it contains are already NULL */
+        tFSNode * node = calloc( 1,sizeof(tFSNode) );
+        if ( node == NULL ) {
+            free( watchedTree );
+            return -ENOMEM;
+        }
+
 
         watchedTree->exec = strdup( exec );
 
@@ -1187,15 +691,24 @@ tError createTree( const char * dir, const char * exec )
         }
 
         if ( result == 0 ) {
-            watchedTree->nextRescan = time( NULL ) + 1;
+            node->type         = kTree;
+            node->watchedTree  = watchedTree;
+            node->path         = watchedTree->root.path;
+            node->relPath      = &node->path[ strlen(node->path) ];
 
-            watchedTree->next = gEvent.treeList;
-            gEvent.treeList   = watchedTree;
+            watchedTree->next  = gEvent.treeList;
+            gEvent.treeList    = watchedTree;
+
+            node->expires.at   = time( NULL ) + 1;
+            node->expires.wait = g.timeout.rescan;
+
+            resetExpiration( node, kRescan );
         } else {
             free( (void *)watchedTree->exec );
             free( (void *)watchedTree->root.path );
             free( (void *)watchedTree->shadow.path );
             free( watchedTree );
+            free( node );
         }
     }
 
@@ -1246,6 +759,7 @@ tError createPidFile( pid_t pid )
     return result;
 }
 
+
 /**
  * @brief
  * @return
@@ -1278,90 +792,8 @@ pid_t getDaemonPID( void )
     return result;
 }
 
-/**
- * @brief
- */
-void removePIDfile( void )
-{
-    if ( g.pidFilename != NULL ) {
-        unlink( g.pidFilename );
-        free(g.pidFilename );
-        g.pidFilename = NULL;
-    }
-}
 
-/**
- * @brief
- * @return
- */
-tError eventLoop( void )
-{
-    int                result = 0;
-    struct epoll_event epollEvents[32];
-
-    do {
-        int timeout = (int)(nextExpiration() - time( NULL ));
-
-        /* * * * * * block waiting for events or a timeout * * * * * */
-        errno = 0;
-        logDebug( "epoll_wait( fd: %d, %p[%ld], %d secs )",
-                  gEvent.epoll.fd,
-                  epollEvents,
-                  sizeof( epollEvents ) / sizeof( struct epoll_event ),
-                  timeout );
-        int count = epoll_wait( gEvent.epoll.fd,
-                                epollEvents,
-                                sizeof( epollEvents ) / sizeof( struct epoll_event ),
-                                timeout * 1000 );
-        /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-        logInfo( "timestamp %ld, count %d, errno %d", time( NULL ), count, errno );
-        if ( count < 0 ) {
-            switch ( errno ) {
-            case EINTR:
-            case EAGAIN:
-                /* harmless */
-                break;
-
-            default:
-                logError( "epoll() returned %d", count );
-                result = -1;
-                break;
-            }
-        } else {
-            int i = 0;
-            while ( i < count && result == 0 ) {
-                result = processEpollEvent( &epollEvents[ i ] );
-                i++;
-            }
-
-            if ( result == 0 ) {
-                result = processExpiredFSNodes();
-            }
-
-            if ( result == 0 ) {
-                result = checkRescans();
-            }
-        }
-
-    } while ( result == 0 );
-
-    logInfo( "loop terminated %d", result );
-    removePIDfile();
-    return result;
-}
-
-/**
- * @brief
- */
-void stopDaemon( void )
-{
-    logCheckpoint();
-    if ( write( gEvent.pipe.exitLoop[kWriteEnd], "!", 1 ) < 1) {
-        logError( "unable to stop daemon" );
-    }
-}
-
-
+#if 0
 /**
  * @brief
  */
@@ -1376,35 +808,9 @@ void daemonExit( void )
  * @brief
  * @param signum
  */
-void daemonSignal( int signum )
+void daemonSignal( unsigned int signum )
 {
-
-#ifdef DEBUG
-    const char * signalAsStr[] = {
-        [0]       = NULL,
-        [SIGHUP]  = "Hangup",
-        [SIGINT]  = "Interactive attention signal",
-        [SIGQUIT] = "Quit",
-        [SIGILL]  = "Illegal instruction",
-        [SIGTRAP] = "Trace/breakpoint trap",
-        [SIGABRT] = "Abnormal termination",
-        [7]       = NULL,
-        [SIGFPE]  = "Erroneous arithmetic operation",
-        [SIGKILL] = "Killed",
-        [10]      = NULL,
-        [SIGSEGV] = "Invalid access to storage",
-        [12]      = NULL,
-        [SIGPIPE] = "Broken pipe",
-        [SIGALRM] = "Alarm clock",
-        [SIGTERM] = "Termination request"
-    };
-
-    const char * sigDesc = "(unknown)";
-    if ( signum <= SIGTERM && signalAsStr[ signum ] != NULL ) {
-        sigDesc = signalAsStr[ signum ];
-    }
-    logInfo( "daemon received signal %d: %s", signum, sigDesc );
-#endif
+    logSignal( signum );
 
     stopDaemon();
 }
@@ -1436,53 +842,54 @@ tError registerHandlers( void )
 
     return result;
 }
+#endif
+
+tError registerFdToEpoll( tFileDscr fd, uint64_t data )
+{
+    tError             result = 0;
+    struct epoll_event epollEvent;
+
+    epollEvent.events = EPOLLIN;
+    epollEvent.data.u64 = data;
+
+    if ( epoll_ctl( gEvent.epoll.fd,
+                    EPOLL_CTL_ADD,
+                    fd,
+                    &epollEvent ) == -1 )
+    {
+        result = -errno;
+        logError( "unable to register fd %d with epoll fd %d",
+                  fd, gEvent.epoll.fd );
+    }
+    return result;
+}
 
 
 /**
- * @brief
- * @return
+ * @brief prepare the main event loop
+ * @return non-zero if the initialization failed
  */
-tError initEpoll( void )
+tError initEventLoop( void )
 {
     tError result = 0;
     gEvent.epoll.fd = epoll_create1( 0 );
 
-    struct epoll_event epollEvent;
 
-    if ( pipe2( gEvent.pipe.exitLoop, 0 ) == -1 ) {
-        result = -errno;
-        logError( "failed to create exitLoop pipe" );
+    sigset_t mask;
+    sigfillset( &mask );
+    sigdelset( &mask, SIGSTOP ); /* can't block or use with signalfd */
+    sigdelset( &mask, SIGKILL ); /* can't block or use with signalfd */
+
+    gEvent.signal.fd = signalfd( -1, &mask, SFD_CLOEXEC );
+    if ( gEvent.signal.fd == -1 ) {
+        result = errno;
+        logError( "unable to allocate a new signal fd" );
     } else {
-        epollEvent.events = EPOLLIN;
-        epollEvent.data.u64 = kExitLoop;
-        if ( epoll_ctl( gEvent.epoll.fd,
-                        EPOLL_CTL_ADD,
-                        gEvent.pipe.exitLoop[kReadEnd],
-                        &epollEvent ) == -1 )
-        {
-            result = -errno;
-            logError( "unable to register exitLoop fd %d with epoll fd %d",
-                      gEvent.pipe.exitLoop[kReadEnd], gEvent.epoll.fd );
-        }
-    }
 
-    if ( pipe2( gEvent.pipe.execTrigger, 0 ) == -1 ) {
-        result = -errno;
-        logError( "failed to create execTrigger pipe" );
-    } else {
-        epollEvent.events = EPOLLIN;
-        epollEvent.data.u64 = kExecTrigger;
+        sigprocmask( SIG_BLOCK, &mask, NULL );
 
+        result = registerFdToEpoll( gEvent.signal.fd, kSignalEvent );
 
-        if ( epoll_ctl( gEvent.epoll.fd,
-                        EPOLL_CTL_ADD,
-                        gEvent.pipe.execTrigger[kReadEnd],
-                        &epollEvent ) == -1 )
-        {
-            logError( "unable to register execTrigger fd %d with epoll fd %d",
-                      gEvent.pipe.execTrigger[kReadEnd], gEvent.epoll.fd );
-            result = -errno;
-        }
     }
 
     return result;
@@ -1502,12 +909,14 @@ tError initDaemon( void )
     result = createPidFile( pid );
 
     if ( result == 0 ) {
-        result = initEpoll();
+        result = initEventLoop();
     }
 
+#if 0
     if ( result == 0 ) {
         result = registerHandlers();
     }
+#endif
 
     return result;
 }
@@ -1524,4 +933,13 @@ tError startDaemon( void )
     result = eventLoop();
 
     return result;
+}
+
+
+/**
+ * @brief
+ */
+void stopDaemon( void )
+{
+    logCheckpoint();
 }

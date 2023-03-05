@@ -10,7 +10,7 @@ typedef int         tWatchID;
 typedef int         tNFTWresult;
 
 typedef enum {
-    kUnmonitored = 0, kFirstSeen, kModified, kMoved, kRetry
+    kUnmonitored = 0, kRescan, kFirstSeen, kModified, kMoved, kRetry
 } tExpiredReason;
 
 typedef struct {
@@ -20,8 +20,9 @@ typedef struct {
 } tDir;
 
 typedef enum {
-    kUnsetNodeType = 0,
-    kDirectory, // start at 1, reserve 0 to mean 'not set'
+    kUnset = 0,
+    kTree,      // start at 1, reserve 0 to mean 'not set'
+    kDirectory,
     kFile
 } tFSNodeType;
 
@@ -29,12 +30,12 @@ typedef enum {
 typedef struct nextWatchedTree tWatchedTree;
 
 typedef struct nextNode {
-    struct nextNode * expiringNext;
+    struct nextNode * next;
 
     tWatchedTree *  watchedTree;
 
-    char *          path;
-    char *          relPath;        /* points within string pointed at 'path' */
+    const char *    path;
+    const char *    relPath;        /* points within string pointed at 'path' */
 
     UT_hash_handle  pathHandle;     /* key for the path hash hashmap */
     UT_hash_handle  watchHandle;    /* key for the watchID hashmap */
@@ -45,10 +46,12 @@ typedef struct nextNode {
     tWatchID        watchID;        /* the watchID iNotify gave us */
     tCookie         cookie;         /* only used for the 'move' events */
 
-    time_t         expires;        /* future time when the watchID will have been idle long enough */
-    time_t         idlePeriod;     /* keep track of how many times we've tried & failed to process this */
-    tExpiredReason expiredReason;  /* why the file was being watched in the first place */
-    int            retries;        /* keep track of how many times we've tried & failed to process this */
+    struct {
+        time_t          at;             /* when it has been idle long enough (i.e. resetExpiration hasn't been called */
+        tExpiredReason  because;        /* why the file was being watched in the first place */
+        time_t          wait;           /* keep track of how long to wait between retries */
+        int             retries;        /* keep track of how many times we've tried & failed to process this */
+    } expires;
 
     tFSNodeType     type;
 } tFSNode;
@@ -60,13 +63,11 @@ typedef struct nextWatchedTree {
     tFSNode * pathHashMap;    // hashmap of the full rootPath, hashed
     tFSNode * cookieHashMap;  // hashmap of the cookie values (as used for IN_MOVED event pairs
 
-    tFSNode * expiringList;   // linked list ordered by ascending expiration time
-
-    time_t nextRescan;
+//    time_t nextRescan;
 
     struct {
         tFileDscr   fd;
-    } inotify;
+    }  inotify;
 
     tDir root;
     tDir shadow;
@@ -76,16 +77,20 @@ typedef struct nextWatchedTree {
 } tWatchedTree;
 
 
-tError     createTree( const char * dir, const char * exec );
+void    forgetNode( tFSNode * fsNode );
 
-tError     fileExpired( tFSNode * fileNode );
+tError  createTree( const char * dir, const char * exec );
 
-tFSNode *  watchNode( tWatchedTree * watchedTree, const char * fullPath, tFSNodeType type );
+tError  fileExpired( tFSNode * node );
 
-pid_t      getDaemonPID( void );
+tError  registerFdToEpoll( tFileDscr fd, uint64_t data );
 
-tError     initDaemon( void );
-tError     startDaemon( void );
-void       stopDaemon( void );
+// tFSNode *  watchNode( tWatchedTree * watchedTree, const char * fullPath, tFSNodeType type );
+
+pid_t   getDaemonPID( void );
+
+tError  initDaemon( void );
+tError  startDaemon( void );
+void    stopDaemon( void );
 
 #endif //PROCESSNEWFILES__EVENTS_H_

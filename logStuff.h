@@ -20,16 +20,16 @@ typedef enum
 
 typedef enum
 {
-    kLogEmergency   = LOG_EMERG,    /* 0: system is unusable */
-    kLogAlert       = LOG_ALERT,        /* 1: action must be taken immediately */
-    kLogCritical    = LOG_CRIT,                /* 2: critical conditions */
-    kLogError       = LOG_ERR,                /* 3: error conditions */
-    kLogWarning     = LOG_WARNING,        /* 4: warning conditions */
-    kLogNotice      = LOG_NOTICE,        /* 5: normal but significant condition */
-    kLogInfo        = LOG_INFO,                /* 6: informational */
-    kLogDebug       = LOG_DEBUG,        /* 7: debug-level messages */
-    kLogFunctions   = 8,            /* (used for function entry/exit logging */
-    kLogMaxPriotity = 9
+    kLogEmergency = LOG_EMERG,    /* 0: system is unusable */
+    kLogAlert     = LOG_ALERT,    /* 1: action must be taken immediately */
+    kLogCritical  = LOG_CRIT,     /* 2: critical conditions */
+    kLogError     = LOG_ERR,      /* 3: error conditions */
+    kLogWarning   = LOG_WARNING,  /* 4: warning conditions */
+    kLogNotice    = LOG_NOTICE,   /* 5: normal but significant condition */
+    kLogInfo      = LOG_INFO,     /* 6: informational */
+    kLogDebug     = LOG_DEBUG,    /* 7: debug-level messages */
+    kLogFunctions,                /* (used for function entry/exit logging */
+    kLogMaxPriotity
 } eLogPriority;
 
 typedef enum
@@ -82,11 +82,13 @@ __attribute__((no_instrument_function));
 #define logInfo( ... )       log( kLogInfo,      __VA_ARGS__ )
 
 #ifdef DEBUG
-#define logDebug( ... )      log( kLogDebug, __VA_ARGS__ )
-#define logCheckpoint()    do { _log( __FILE__, __LINE__, __func__, 0, kLogDebug, "reached" ); } while (0)
+#define logDebug( ... )      log( kLogDebug,     __VA_ARGS__ )
+#define logCheckpoint()      do { _log( __FILE__, __LINE__, __func__, 0, kLogDebug, "reached" ); } while (0)
+#define logSetErrno( val )   do { errno = val; } while (0)
 #else
-#define logDebug(...)      do {} while (0)
-#define logCheckpoint()    do {} while (0)
+#define logDebug( ... )      do {} while (0)
+#define logCheckpoint()      do {} while (0)
+#define logSetErrno( val )   do {} while (0)
 #endif
 
 #ifdef __cplusplus
