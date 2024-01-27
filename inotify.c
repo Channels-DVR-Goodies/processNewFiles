@@ -11,7 +11,6 @@
 #include <sys/inotify.h>
 
 #include "events.h"
-#include "logStuff.h"
 #include "rescan.h"
 #include "inotify.h"
 
@@ -187,7 +186,7 @@ void logEvent( const struct inotify_event * event, const tFSNode * watchedNode )
         const tWatchedTree * watchedTree = watchedNode->watchedTree;
         if ( watchedTree != NULL ) {
             tFSNode * fsNode;
-            HASH_FIND( watchHandle, watchedTree->watchHashMap, &event->wd, sizeof( tWatchID ), fsNode );
+            hashMapFind(watchedTree->watchMap, event->wd, (void **)&fsNode);
             if ( fsNode == NULL ) {
                 logError( "Error: watchID [%02d] not found", event->wd );
             } else {
@@ -227,15 +226,9 @@ tHash calcHash( const char * string )
  * @param existingEntry
  * @return
  */
-int orderedByExpiration(const tFSNode * newEntry, const tFSNode * existingEntry )
+bool orderedByExpiration(tListEntry * newEntry, tListEntry * existingEntry )
 {
-    if (newEntry->expires.at < existingEntry->expires.at ) {
-        return -1;
-    }
-    if (newEntry->expires.at > existingEntry->expires.at ) {
-        return 1;
-    }
-    return 0;
+    return ( ((tFSNode *)newEntry)->expires.at > ((tFSNode *)existingEntry)->expires.at );
 }
 
 
@@ -246,20 +239,22 @@ int orderedByExpiration(const tFSNode * newEntry, const tFSNode * existingEntry 
  * @param reason
  * @param node
  */
-void resetExpiration(tFSNode * node, tExpiredReason reason )
+void resetExpiration( tFSNode * node, tExpiredReason reason )
 {
     if (node != NULL)
     {
-        time_t when = time(NULL ) + node->expires.wait;
+        time_t when = time(NULL ) + node->expires.every;
 
-        logDebug( "resetExpiration of %s", node->relPath );
         node->expires.because = reason;
         if (node->expires.at != when ) {
-            if ( g.expiringList != NULL ) {
-                LL_DELETE2(g.expiringList, node, next );
+            if ( listEntryValid( &node->queue ) )
+            {
+                listRemove( &node->queue );
             }
             node->expires.at = when;
-            LL_INSERT_INORDER2(g.expiringList, node, orderedByExpiration, next );
+            listInsert( g.expiringList, &node->queue, orderedByExpiration );
+
+            logDebug( "Expiration of %s was reset to %ld secs", node->relPath, node->expires.at - time( NULL ) );
         }
     }
 }
@@ -281,10 +276,10 @@ tFSNode * fsNodeFromPath( tWatchedTree * watchedTree, const char * fullPath, tFS
     }
 
     tHash hash = calcHash( fullPath );
-    HASH_FIND(pathHandle, watchedTree->pathHashMap, &hash, sizeof( tHash ), node );
+    hashMapFind(watchedTree->pathMap, hash, (void **)&node);
 
     if ( node == NULL ) {
-        node = (tFSNode *)calloc(1, sizeof( tFSNode ) );
+        node = (tFSNode *)calloc( 1, sizeof( tFSNode ) );
         node->type        = type;
         node->watchedTree = watchedTree;
         node->path        = strdup(fullPath );
@@ -294,22 +289,24 @@ tFSNode * fsNodeFromPath( tWatchedTree * watchedTree, const char * fullPath, tFS
             ++node->relPath;
         }
 
-        HASH_ADD(pathHandle, watchedTree->pathHashMap, pathHash, sizeof( tHash ), node );
+        hashMapFind(watchedTree->pathMap, node->pathHash, (void **)&node);
 
         switch (type)
         {
         case kFile:
-            node->expires.wait  = g.timeout.idle;
-            resetExpiration(node, kFirstSeen );
+            node->expires.at      = time( NULL ) + g.timeout.idle;
+            node->expires.every   = g.timeout.idle;
+            node->expires.because = kFirstSeen;
+            listInsert( g.expiringList, &node->queue, orderedByExpiration );
             break;
 
         case kDirectory:
-            node->watchID = inotify_add_watch(watchedTree->inotify.fd, fullPath, IN_ALL_EVENTS);
-            logInfo("watch [%d] %s", node->watchID, fullPath);
+            node->watchID = inotify_add_watch( watchedTree->inotify.fd, fullPath, IN_ALL_EVENTS );
+            logInfo( "watch [%d] %s", node->watchID, fullPath );
             if (node->watchID == -1 ) {
                 logError( "problem watching directory \'%s\'", fullPath );
             } else {
-                HASH_ADD(watchHandle, watchedTree->watchHashMap, watchID, sizeof( tWatchID ), node );
+                hashMapAdd(watchedTree->watchMap, node->watchID, node);
             }
             break;
 
@@ -317,6 +314,20 @@ tFSNode * fsNodeFromPath( tWatchedTree * watchedTree, const char * fullPath, tFS
             break;
         }
 
+        size_t len = strlen(fullPath) + 1; // for the trailing null
+        char * path = malloc( len + 1);
+        if (path != NULL)
+        {
+            memcpy( path, fullPath, len );
+
+            if ( type != kFile )
+            {
+                strcat( path, "/" );
+            }
+            radixTreeAdd(g.pathTree, path, node);
+
+            free( path );
+        }
         // logFsNode( node );
     }
 
@@ -334,7 +345,7 @@ tFSNode * fsNodeFromWatchID( const tWatchedTree * watchedTree, tWatchID watchID 
 {
     tFSNode * fsNode;
 
-    HASH_FIND( watchHandle, watchedTree->watchHashMap, &watchID, sizeof( tWatchID ), fsNode );
+    hashMapFind(watchedTree->watchMap, watchID, (void **)&fsNode);
     return fsNode;
 }
 
@@ -389,7 +400,7 @@ void removeWatchID( tWatchedTree * watchedTree, tWatchID watchID )
      * seeing it again. so clean up our parallel structures */
     tFSNode * fsNode;
 
-    HASH_FIND( watchHandle, watchedTree->watchHashMap, &watchID, sizeof( tWatchID ), fsNode );
+    hashMapFind(watchedTree->watchMap, watchID, (void **)&fsNode);
     if ( fsNode != NULL ) {
         logDebug( "ignore [%d]", watchID );
         removeNode( fsNode );
@@ -399,8 +410,6 @@ void removeWatchID( tWatchedTree * watchedTree, tWatchID watchID )
 
 /**
  * @brief
- * @param watchedTree
- * @param fullPath
  * @param pathNode
  */
 void doiNotifyDelete( tFSNode * pathNode )
@@ -417,11 +426,7 @@ void doiNotifyDelete( tFSNode * pathNode )
 
 
 /**
- * @brief
- * @param watchedTree
- * @param event
- * @param fullPath
- * @param expires
+ *
  * @param pathNode
  */
 void doiNotifyCreate( tFSNode * pathNode )
@@ -435,8 +440,6 @@ void doiNotifyCreate( tFSNode * pathNode )
 
 /**
  * @brief
- * @param watchedTree
- * @param expires
  * @param pathNode
  */
 void doiNotifyCloseWrite( tFSNode * pathNode )
@@ -451,12 +454,9 @@ void doiNotifyCloseWrite( tFSNode * pathNode )
 
 /**
  * @brief
- * @param watchedTree
+ * @param pathNode
  * @param event
  * @param fullPath
- * @param hash
- * @param expires
- * @param pathNode
  */
 void doiNotifyMove( tFSNode * pathNode,
                     const struct inotify_event * event,
@@ -468,11 +468,11 @@ void doiNotifyMove( tFSNode * pathNode,
      * tied together with the same (non-zero) cookie value  */
     if ( event->cookie != 0 ) {
         tFSNode * cookieNode;
-        HASH_FIND( cookieHandle, watchedTree->cookieHashMap, &event->cookie, sizeof( tCookie ), cookieNode );
+        hashMapFind(watchedTree->cookieMap, event->cookie, (void **)&cookieNode);
         if ( cookieNode == NULL ) {
             cookieNode = pathNode;
             cookieNode->cookie = event->cookie;
-            HASH_ADD( cookieHandle, watchedTree->cookieHashMap, cookie, sizeof( tCookie ), cookieNode );
+            hashMapAdd(watchedTree->cookieMap, cookieNode->cookie, cookieNode);
         }
 
         // occurs first of the pair - figure out the existing pathNode
@@ -483,13 +483,13 @@ void doiNotifyMove( tFSNode * pathNode,
 
         // occurs second of the pair - update the root.path in the cookieNode identified in the IN_MOVED_FROM
         if ( event->mask & IN_MOVED_TO && cookieNode != NULL ) {
-            HASH_DELETE( pathHandle, watchedTree->pathHashMap, cookieNode );
+            hashMapRemove(watchedTree->pathMap, cookieNode->cookie);
             free((void *)cookieNode->path );
             cookieNode->path     = strdup( fullPath );
             cookieNode->pathHash = calcHash( cookieNode->path );
-            HASH_ADD( pathHandle, watchedTree->pathHashMap, pathHash, sizeof( tHash ), cookieNode );
+            hashMapAdd(watchedTree->pathMap, cookieNode->pathHash, cookieNode);
 
-            HASH_DELETE( cookieHandle, watchedTree->cookieHashMap, cookieNode );
+            hashMapRemove(watchedTree->cookieMap, cookieNode->cookie);
             cookieNode->cookie = 0;
 
             resetExpiration( cookieNode, kMoved );

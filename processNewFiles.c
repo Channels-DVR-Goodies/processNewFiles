@@ -10,7 +10,6 @@
 #include <libconfig.h>
 
 #include "events.h"
-#include "logStuff.h"
 
 
 /** shared globals */
@@ -349,6 +348,12 @@ tError main( int argc, char * argv[] )
         g.executableName = argv[ 0 ];
     }
     initLogStuff( g.executableName );
+
+    g.expiringList = newList();
+    g.readyList = newList();
+    g.executingList = newList();
+
+    g.pathTree = newRadixTree();
 
     result = initDaemon();
 

@@ -5,12 +5,15 @@
 #ifndef PROCESSNEWFILES__EVENTS_H_
 #define PROCESSNEWFILES__EVENTS_H_
 
+#include <stdint.h>
+#include "list.h"
+
 typedef uint32_t    tCookie;
 typedef int         tWatchID;
 typedef int         tNFTWresult;
 
 typedef enum {
-    kUnmonitored = 0, kRescan, kFirstSeen, kModified, kMoved, kRetry
+    kUnset = 0, kTreeRoot, kRescan, kFirstSeen, kModified, kMoved, kRetry
 } tExpiredReason;
 
 typedef struct {
@@ -20,8 +23,7 @@ typedef struct {
 } tDir;
 
 typedef enum {
-    kUnset = 0,
-    kTree,      // start at 1, reserve 0 to mean 'not set'
+    kTree = 1,      // start at 1, reserve 0 to mean 'not set'
     kDirectory,
     kFile
 } tFSNodeType;
@@ -29,41 +31,36 @@ typedef enum {
 /* circular dependency, so forward-declare tWatchedTree */
 typedef struct nextWatchedTree tWatchedTree;
 
-typedef struct nextNode {
-    struct nextNode * next;
+typedef struct sFSNode {
+    tListEntry      queue;
 
     tWatchedTree *  watchedTree;
 
     const char *    path;
-    const char *    relPath;        /* points within string pointed at 'path' */
+    const char *    relPath;    // points within string pointed at 'path'
 
-    UT_hash_handle  pathHandle;     /* key for the path hash hashmap */
-    UT_hash_handle  watchHandle;    /* key for the watchID hashmap */
-    UT_hash_handle  cookieHandle;   /* key for the cookie hashmap (only used
-                                     * to match up pairs of 'move' events */
-
-    tHash           pathHash;       /* hash of the full path */
-    tWatchID        watchID;        /* the watchID iNotify gave us */
-    tCookie         cookie;         /* only used for the 'move' events */
+    tHash           pathHash;   // hash of the full path
+    tWatchID        watchID;    // the watchID iNotify gave us
+    tCookie         cookie;     // only used for the 'move' events
 
     struct {
-        time_t          at;             /* when it has been idle long enough (i.e. resetExpiration hasn't been called */
-        tExpiredReason  because;        /* why the file was being watched in the first place */
-        time_t          wait;           /* keep track of how long to wait between retries */
-        int             retries;        /* keep track of how many times we've tried & failed to process this */
+        time_t          at;         // when it has been idle long enough (i.e. resetExpiration hasn't been called)
+        tExpiredReason  because;    // why the file was being watched in the first place
+        time_t          every;      // keep track of how long to wait between retries
+        int             retries;    // keep track of how many times we've tried & failed to process this
     } expires;
 
     tFSNodeType     type;
 } tFSNode;
 
 typedef struct nextWatchedTree {
-    struct nextWatchedTree *  next;
+    tListEntry  queue;
 
-    tFSNode * watchHashMap;   // hashmap of the watchID
-    tFSNode * pathHashMap;    // hashmap of the full rootPath, hashed
-    tFSNode * cookieHashMap;  // hashmap of the cookie values (as used for IN_MOVED event pairs
+    tFSNode *   rootNode;   // the tree's root node. it expires regularly to trigger a rescan of this hierarchy
 
-//    time_t nextRescan;
+    tHashMap *  pathMap;    // the path hash hashmap
+    tHashMap *  watchMap;   // the watchID hashmap
+    tHashMap *  cookieMap;  // the cookie hashmap (only used to match up pairs of 'move' events)
 
     struct {
         tFileDscr   fd;
@@ -84,8 +81,6 @@ tError  createTree( const char * dir, const char * exec );
 tError  fileExpired( tFSNode * node );
 
 tError  registerFdToEpoll( tFileDscr fd, uint64_t data );
-
-// tFSNode *  watchNode( tWatchedTree * watchedTree, const char * fullPath, tFSNodeType type );
 
 pid_t   getDaemonPID( void );
 

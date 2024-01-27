@@ -11,7 +11,6 @@
 #include "events.h"
 #include "inotify.h"
 
-#include "logStuff.h"
 
 /* Unfortunately, the API for nftw() doesn't support the caller
  * providing an opaque structure to be passed through to the
@@ -21,10 +20,11 @@ tWatchedTree *  gWatchedTree;
 
 
 /**
- * @brief
+ *
+ * @param watchedTree
+ * @param sb
  * @param fullPath
  * @param ftwbuf
- * @param watchedTree
  * @return
  */
 tNFTWresult scanFileNode( tWatchedTree *      watchedTree,
@@ -32,7 +32,9 @@ tNFTWresult scanFileNode( tWatchedTree *      watchedTree,
                           const char *        fullPath,
                           const struct FTW *  ftwbuf )
 {
+#if 0
     const char * status = NULL;
+#endif
 
     const char * relPath = &fullPath[ watchedTree->root.pathLen ];
     if ( *relPath == '/' ) {
@@ -46,7 +48,9 @@ tNFTWresult scanFileNode( tWatchedTree *      watchedTree,
             if ( errno == ENOENT ) {
                 /* shadow file does not exist, so create a fresh file node */
                 fsNodeFromPath( watchedTree, fullPath, kFile );
+#if 0
                 status = "first seen";
+#endif
             } else {
                 logError( "Failed to get info about shadow file \'%s\'", relPath );
             }
@@ -54,21 +58,27 @@ tNFTWresult scanFileNode( tWatchedTree *      watchedTree,
             if (shadowInfo.st_mode & (S_IXUSR | S_IXGRP) ) {
                 /* shadow file is *already* present and executable */
                 fsNodeFromPath( watchedTree, fullPath, kFile );
+#if 0
                 status = "retry";
+#endif
             }
             /* is the shadow file much older than the original? */
             if ( (sb->st_mtim.tv_sec - shadowInfo.st_mtim.tv_sec ) > g.timeout.idle ) {
                 /* queue up the file to expire. Don't expire immediately in case we
                  * started up while the file was in the midst if being modified */
                 fsNodeFromPath( watchedTree, fullPath, kFile );
+#if 0
                 status = "modified";
+#endif
             }
         } else {
             logError( "the shadow file \'%s/%s\' is not a regular file", watchedTree->shadow.path, relPath );
         }
+#if 0
         if ( status != NULL ) {
             logDebug( "%d%-*c file: %s (%s)", ftwbuf->level, ftwbuf->level * 4, ':', relPath, status );
         }
+#endif
     }
 
     return FTW_CONTINUE;
@@ -140,8 +150,10 @@ tNFTWresult scanNode( const char * fullPath, const struct stat * sb, int typefla
 {
     tNFTWresult result = FTW_CONTINUE;
 
-    if ( gWatchedTree != NULL ) {
-        switch ( typeflag ) {
+    if ( gWatchedTree != NULL )
+    {
+        switch ( typeflag )
+        {
         case FTW_F: // fullPath is a regular file.
             result = scanFileNode( gWatchedTree, sb, fullPath, ftwbuf );
             break;
@@ -156,6 +168,35 @@ tNFTWresult scanNode( const char * fullPath, const struct stat * sb, int typefla
         }
     }
 
+    tFSNode * fsNode;
+
+    size_t len = strlen( fullPath ) + 1;
+    char * path = malloc( len + 2 );
+    if ( path != NULL )
+    {
+        strncpy( path, fullPath, len );
+        if ( typeflag == FTW_D )
+        {
+            strncat( path, "/", len + 1 );
+        }
+
+        if (radixTreeFind(g.pathTree, path, (void **) &fsNode) != 0 )
+        {
+            logError( "\'%s\' does not match", path );
+        }
+        else
+        {
+            if ( fsNode == NULL )
+                logInfo( "matched \'%s\', but value is null", path );
+#if 0
+            else
+                logInfo( "\'%s\' matches", fsNode->path );
+#endif
+        }
+
+        free( path );
+    }
+
     logSetErrno( 0 );
     return result;
 }
@@ -167,22 +208,23 @@ tNFTWresult scanNode( const char * fullPath, const struct stat * sb, int typefla
  * @param watchedTree
  * @return
  */
-tError rescanTree( tWatchedTree * watchedTree )
+tError rescanTree( tFSNode * node )
 {
     int result = 0;
 
-    if ( watchedTree != NULL ) {
+    gWatchedTree = node->watchedTree;
 
-        gWatchedTree = watchedTree;
-
-        result = nftw( watchedTree->root.path, scanNode, 12, FTW_ACTIONRETVAL | FTW_MOUNT );
-        if ( result != 0 ) {
-            logError( "Error: failed to scan for new files in the \'%s\' directory", watchedTree->root.path );
-            result = -errno;
-        }
-
-        gWatchedTree = NULL;
+    result = nftw( node->path, scanNode, 12, FTW_ACTIONRETVAL | FTW_MOUNT );
+    if ( result != 0 ) {
+        logError( "Error: failed to scan for new files in the \'%s\' directory", node->path );
+        result = -errno;
     }
+
+    gWatchedTree = NULL;
+
+    resetExpiration( node, kRescan );
+
+    // radixTreeDump( &g.pathTree );
 
     return result;
 }
@@ -190,20 +232,19 @@ tError rescanTree( tWatchedTree * watchedTree )
 tError rescanAllTrees( void )
 {
     tError result = 0;
-    tFSNode ** prev = &g.expiringList;
-    for ( tFSNode * node = *prev; node != NULL; node = node->next )
+    time_t now = time( NULL );
+    tFSNode * node;
+    listForEachEntry(&g.expiringList, node )
     {
         if ( node->type == kTree )
         {
-            /* unlink it from expiringList */
-            *prev = node->next;
+            /* unlink it from its current position in expiringList */
+            listRemove( &node->queue );
             /* force it to expire immediately */
-            node->expires.at = time( NULL );
+            node->expires.at = now;
             /* put it first on expiringList */
-            node->next = g.expiringList;
-            g.expiringList = node;
+            listPrepend( g.expiringList, &node->queue );
         }
-        prev = &node->next;
     }
 
     return result;

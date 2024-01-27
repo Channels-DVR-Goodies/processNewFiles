@@ -7,8 +7,7 @@
 #ifndef PROCESSNEWFILES__RESCAN_H_
 #define PROCESSNEWFILES__RESCAN_H_
 
-tError rescanTree( tWatchedTree * watchedTree );
+tError rescanTree( tFSNode * watchedTree );
 tError rescanAllTrees( void );
-
 
 #endif //PROCESSNEWFILES__RESCAN_H_
